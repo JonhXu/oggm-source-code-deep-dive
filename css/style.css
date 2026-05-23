@@ -193,6 +193,11 @@ pre code {
   background: #e8f8f5;
 }
 
+.callout.author {
+  border-left-color: #34495e;
+  background: #f4f6f7;
+}
+
 .callout-title {
   font-weight: 700;
   margin-bottom: 4px;
