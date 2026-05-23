@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第8章 物质平衡模型：理论与实现 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第8章 物质平衡模型：理论与实现</h1>
+
+<p>
+<code>massbalance.py</code> 约2656行，是OGGM中规模最大的物理模块。它将气候输入（第7章）和冰川几何（第6章）转化为不同海拔处的积累、融化和净物质平衡。本章从最基础的标量物质平衡开始，逐步深入到月度温度指数模型（MonthlyTIModel, temperature-index model）、参数校准框架以及多流线系统中的物质平衡分配。
+</p>
+
+<div class="callout tip">
+  <div class="callout-title">本章最少要掌握什么</div>
+  <p>初学者先抓住一条主线：温度和降水经过高度订正后，被月度温度指数模型（MonthlyTIModel, temperature-index model）转换为积累、融化和净物质平衡；校准过程再用大地测量或原位观测约束<code>melt_f</code>、<code>temp_bias</code>和<code>prcp_fac</code>。8.5以后涉及多种校准函数，第一遍只需理解它们服务于同一个目标：让模型的平均物质平衡与观测一致。</p>
+</div>
+
+<div class="callout warning">
+  <div class="callout-title">单位提醒</div>
+  <p>OGGM内部动力学接口常使用<code>m ice s^-1</code>，而观测、论文和诊断图常使用<code>mm w.e. yr^-1</code>或<code>kg m^-2 yr^-1</code>。读代码时看到物质平衡数值异常小，往往是因为它仍处在内部单位，而不是模型没有融化或积累。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>8.1 MassBalanceModel基类与设计哲学</h2>
+
+<p>
+<code>MassBalanceModel</code>（约第35行）是所有物质平衡模型的抽象基类。其设计遵循OGGM特有的<code>SuperclassMeta</code>元类模式，这提供了一种"轻量级抽象基类"——在实例化时检查子类是否实现了必需的方法，而不是在导入时：
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">MassBalanceModel</span>(<span class="kw">object</span>, <span class="dec">metaclass</span>=SuperclassMeta):
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="dec">self</span>, <span class="dec">valid_bounds</span>=(<span class="dec">-1e4</span>, <span class="dec">1e4</span>), <span class="dec">fl_id</span>=<span class="dec">0</span>):
+        <span class="dec">self</span>.valid_bounds = valid_bounds
+        <span class="dec">self</span>.fl_id = fl_id
+
+    <span class="kw">def</span> <span class="fn">get_monthly_mb</span>(<span class="dec">self</span>, <span class="dec">heights</span>, <span class="dec">year</span>=<span class="kw">None</span>):
+        <span class="kw">raise</span> <span class="dec">NotImplementedError</span>()
+
+    <span class="kw">def</span> <span class="fn">get_annual_mb</span>(<span class="dec">self</span>, <span class="dec">heights</span>, <span class="dec">year</span>=<span class="kw">None</span>):
+        <span class="kw">return</span> np.sum(<span class="dec">self</span>.get_monthly_mb(heights, <span class="dec">year</span>=<span class="dec">year</span>), <span class="dec">axis</span>=<span class="dec">0</span>)</code></pre>
+
+<p>
+关键接口（子类必须实现的方法）：<code>get_monthly_mb(heights, year)</code> 在给定浮点年份上返回各海拔点的月物质平衡，OGGM内部单位为 m ice s<sup>-1</sup>；<code>get_annual_mb</code>返回年平均意义下的物质平衡，单位同样为 m ice s<sup>-1</sup>。在与观测比较或写入诊断量时，OGGM再按冰密度和时间长度换算为 kg m<sup>-2</sup>、m w.e. 或 mm w.e. yr<sup>-1</sup>。<code>heights</code>是各网格点的海拔（米），<code>year</code>指定气候年份。
+</p>
+
+<span class="tag tag-beginner">入门</span>
+<div class="callout tip">
+  <div class="callout-title">物质平衡的符号约定</div>
+  <p>
+    在OGGM中，<strong>负值表示物质损失，正值表示物质增加</strong>。内部动力学常用冰当量速度（m ice s<sup>-1</sup>），而输出和观测常用水当量（water equivalent, w.e.; mm w.e. yr<sup>-1</sup>）。冰密度默认取900 kg m<sup>-3</sup>，因此1 m w.e. 约相当于1.11 m冰当量。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>8.2 简化物质平衡模型</h2>
+
+<h3>8.2.1 ScalarMassBalance</h3>
+
+<p>
+<code>ScalarMassBalance</code>（约第258行）是最简单的模型，在所有海拔上施加均匀的物质平衡：<code>MB(z) = const</code>。主要用途包括：
+</p>
+
+<ul>
+  <li>单元测试和sanity check</li>
+  <li>概念性实验（如研究均匀MB下的冰川响应）</li>
+  <li>初始化迭代求解器</li>
+</ul>
+
+<h3>8.2.2 LinearMassBalance</h3>
+
+<p>
+<code>LinearMassBalance</code>（约第286行）是经典线性模型：
+</p>
+
+<pre><code>MB(z) = (z - ELA) * grad</code></pre>
+
+<p>
+其中<code>ELA</code>是平衡线高度（m），<code>grad</code>是MB梯度（mm w.e. m<sup>-1</sup> year<sup>-1</sup>，通常约0.007-0.010）。它提供了一个<code>temp_bias</code>属性：温度每升高1K，<code>ELA</code>上升150m（经验法则：150 m K<sup>-1</sup>）。这是一个粗略但有物理依据的近似。
+</p>
+
+<!-- ================================================================== -->
+<h2>8.3 MonthlyTIModel：月度温度指数模型（MonthlyTIModel, temperature-index model）</h2>
+
+<p>
+<code>MonthlyTIModel</code>（约第349行）是OGGM的"常用"物质平衡模型，每月的物质平衡通过温度指数（degree-day）方法计算融化量、通过降水相分离分配积累：
+</p>
+
+<h3>8.3.1 融化计算</h3>
+
+<pre><code>M_m = melt_f * (<span class="dec">365</span>/<span class="dec">12</span>) * max(T - T_melt, <span class="dec">0</span>)</code></pre>
+
+<p>
+其中<code>T_melt</code>是融化阈值温度。OGGM v1.6.3的默认值为 -1.0 °C，而不是0.0 °C；在月时间尺度上，月均温度低于0 °C时仍可能出现日间融化，负阈值可以经验性地吸收这类亚月尺度效应。<code>melt_f</code> 在配置文件中的单位为 kg m<sup>-2</sup> day<sup>-1</sup> K<sup>-1</sup>，数值上等价于 mm w.e. day<sup>-1</sup> K<sup>-1</sup>。
+</p>
+
+<h3>8.3.2 降水相判定</h3>
+
+<p>固态降水比例通过线性过渡区确定：</p>
+
+<pre><code>f_solid = clip(<span class="dec">1</span> - (T - T_solid) / (T_liquid - T_solid), <span class="dec">0</span>, <span class="dec">1</span>)</code></pre>
+
+<p>
+其中<code>T_solid=0°C</code>（低于此温度全部视为固态降水），<code>T_liquid=2°C</code>（高于此温度全部视为液态降水）。在0-2 °C之间，雨雪比例线性过渡，例如1 °C时固态比例为50%。这是温度指数模型（temperature-index model）中常用的经验近似，而不是对降水相态微物理过程的显式模拟。
+</p>
+
+<pre><code>Prcp_sol(z) = Prcp(z) * f_solid(T(z))
+Prcp_liq(z) = Prcp(z) * (<span class="dec">1</span> - f_solid(T(z)))
+
+MB_monthly(z) = Prcp_sol(z) - M_m(z)   <span class="cmt"># kg m-2 month-1</span></code></pre>
+
+<h3>8.3.3 温度降尺度</h3>
+
+<p>
+温度通过梯度从参考高度外推到各海拔：
+</p>
+
+<pre><code>T(z) = T_ref + grad * (z - ref_hgt)</code></pre>
+
+<p>
+默认梯度<code>grad = -0.0065 K/m</code>（标准大气递减率量级）。如果气候文件中提供了<code>gradient</code>变量，则优先使用。气候数据的访问通过<code>get_monthly_climate(heights, year)</code> 方法处理，返回四个数组：<code>temp</code>、<code>tempformelt</code>、<code>prcp</code>、<code>prcpsol</code>。
+</p>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">温度梯度的时间可变性</div>
+  <p>
+    CRU和W5E5等月尺度数据通常需要从参考高程外推到冰川高程带。实际温度递减率会随季节、天气型和地形条件变化；在热带、高山干旱区或逆温频发地区，固定梯度可能引入系统性误差。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>8.4 物质平衡模型的层次结构</h2>
+
+<h3>8.4.1 ConstantMassBalance</h3>
+
+<p>
+<code>ConstantMassBalance</code>（约第705行）通过多年平均得到一个固定的物质平衡气候。它覆盖<code>[y0-halfsize, y0+halfsize]</code>窗口内的年份，并缓存相应的温度和固态降水信息，适合平衡态实验、spinup或理想化敏感性试验。
+</p>
+
+<h3>8.4.2 RandomMassBalance</h3>
+
+<p>
+<code>RandomMassBalance</code>（约第916行）从历史气候序列中随机抽选年份，生成逐年的物质平衡序列。用于蒙特卡罗敏感性实验——在不确定未来气候路径时，以历史年份的随机排列作为替代。
+</p>
+
+<h3>8.4.3 UncertainMassBalance</h3>
+
+<p>
+<code>UncertainMassBalance</code>（约第1062行）是在另一个MB模型上应用<strong>高斯噪声</strong>的装饰器（decorator模式）——对底层模型的参数（如melt_f, temp_bias）叠加噪声，输出带有误差条的物质平衡。用于参数不确定性的传播分析。
+</p>
+
+<h3>8.4.4 MultipleFlowlineMassBalance</h3>
+
+<p>
+<code>MultipleFlowlineMassBalance</code>（约第1178行）处理有支流的冰川系统。它将物质平衡模型分派到各条流线，并用<code>fl_id</code>等机制区分不同分支；在合并冰川或多冰川系统中，也可通过气候文件后缀（filesuffix）管理不同冰川目录（GlacierDirectory）对应的气候输入。
+</p>
+
+<!-- ================================================================== -->
+<h2>8.5 物质平衡校准框架</h2>
+
+<p>
+物质平衡校准是OGGM中最重要的技术环节之一。模型的核心参数（<code>melt_f</code>、<code>temp_bias</code>、<code>prcp_fac</code>）不应被当作任意调节旋钮；它们需要通过观测约束来确定，使模型输出与大地测量或原位观测的冰川平均物质平衡一致。
+</p>
+
+<h3>8.5.1 冬季降水因子（precipitation factor；decide_winter_precip_factor）</h3>
+
+<p>
+<code>decide_winter_precip_factor</code>（约第1452行）根据冬季降水设置经验性降水因子（precipitation factor）：
+</p>
+
+<pre><code>prcp_fac = empirical_function(winter_prcp, ...)</code></pre>
+
+<p>
+其逻辑基于：冬季降水丰富的地区（如挪威沿海）的累积过程主要受限于降水，气候数据在捕获此过程时可能存在系统性偏差。经验因子来自全球冰川观测数据的统计拟合。
+</p>
+
+<h3>8.5.2 标量MB校准（mb_calibration_from_scalar_mb）</h3>
+
+<p>
+<code>mb_calibration_from_scalar_mb</code>（约第1968行）是核心校准函数，使用三步优化策略：
+</p>
+
+<ol>
+  <li><strong>步1：prcp_fac</strong>——通过固定<code>melt_f</code>和<code>temp_bias</code>，校准到给定降水因子（precipitation factor）使得MB参考期年均MB匹配目标值。使用<code>brentq</code>（一维括号寻根）。</li>
+  <li><strong>步2：melt_f</strong>——固定<code>prcp_fac</code>，调节<code>melt_f</code>使MB匹配目标。</li>
+  <li><strong>步3：temp_bias</strong>——固定前两个参数，微调<code>temp_bias</code>做最终对齐。</li>
+</ol>
+
+<h3>8.5.3 大地测量MB校准（mb_calibration_from_geodetic_mb）</h3>
+
+<p>
+<code>mb_calibration_from_geodetic_mb</code>（约第1774行）使用Hugonnet et al. (2021) 的卫星测高数据（dmdtda），配合<code>informed_threestep</code>方法：
+</p>
+
+<pre><code><span class="cmt"># informed_threestep 的核心流程（Huss & Hock 2015）</span>
+<span class="cmt"># 1. prcp_fac：来自冬季降水的经验公式</span>
+<span class="cmt"># 2. melt_f：Brent校准到大地测量MB（dmdtda观测）</span>
+<span class="cmt"># 3. temp_bias：上一步的余差调整</span></code></pre>
+
+<p>
+大地测量物质平衡（geodetic mass balance）数据提供2000-2020年期间的冰川高程变化率和质量变化估计。相比传统地面测量，卫星测高数据覆盖范围更广，但仍受DEM误差、穿透深度、密度换算和地形遮蔽等因素影响；它是全球尺度校准的重要约束，而不是无误差真值。
+</p>
+
+<h3>8.5.4 WGMS原位测量校准（mb_calibration_from_wgms_mb）</h3>
+
+<p>
+<code>mb_calibration_from_wgms_mb</code>（约第1506行）使用世界冰川监测服务（WGMS）的实际冰川测量数据。校准逻辑是逐年的：寻找<code>temp_bias</code>使得模拟的年度MB序列与WGMS测量值最接近。
+</p>
+
+<h3>8.5.5 全时间序列校准（mb_calibration_to_rmsd）</h3>
+
+<p>
+<code>mb_calibration_to_rmsd</code>（约第1532行）是最全面的校准方法，使用<code>scipy.optimize.differential_evolution</code>（差分演化全局优化）在整个观测年范围内最小化模拟和观测MB之间的RMSD。
+</p>
+
+<!-- ================================================================== -->
+<h2>8.6 表观物质平衡（apparent mass balance）与平衡线高度</h2>
+
+<h3>8.6.1 apparent_mb_from_any_mb</h3>
+
+<p>
+<code>apparent_mb_from_any_mb</code>（约第2438行）将"气候物质平衡"（constant climate下的MB）转换为"表观物质平衡（apparent mass balance）"（考虑冰川在给定年份的实际几何变化）。它通过<code>brentq</code>求解一个残差方程：固定几何（fixed geometry）下的MB在给定年与实际质量变化之间的匹配。
+</p>
+
+<h3>8.6.2 fixed_geometry_mass_balance</h3>
+
+<p>
+<code>fixed_geometry_mass_balance</code>（约第2538行）计算假设冰川几何不变时的物质平衡，用于与观测数据校准中的"几何变化效应"分离。
+</p>
+
+<h3>8.6.3 compute_ela</h3>
+
+<p>
+<code>compute_ela</code>（约第2605行）从逐年的物质平衡剖面中计算平衡线高度（ELA）——即MB(z)=0的海拔。通过插值多个年度的MB剖面得到时间序列。
+</p>
+
+<!-- ================================================================== -->
+<h2>8.7 MB_GLOBAL_PARAMS 冻结/检查机制</h2>
+
+<p>
+当<code>cfg.PARAMS['mb_global_params']</code>不为空时，所有冰川的物质平衡参数（<code>melt_f</code>, <code>temp_bias</code>, <code>prcp_fac</code>）被冻结为全局值，跳过个体校准。这个机制用于：
+</p>
+<ul>
+  <li>敏感性实验（探究单一参数对全球模型的影响）</li>
+  <li>强制所有冰川使用相同的气候参数以检验参数对GMST变化的统一响应</li>
+  <li>当校准数据匮乏时，使用相邻冰川的参数</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>8.8 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>默认值</th><th>作用</th><th>单元</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>melt_f</code></td><td>5.0（校准可变）</td><td>温度指数融化因子（temperature-index melt factor）</td><td>kg m<sup>-2</sup> d<sup>-1</sup> K<sup>-1</sup></td></tr>
+    <tr><td><code>temp_bias</code></td><td>校准确定（~0 ± 3）</td><td>系统温度偏移</td><td>K</td></tr>
+    <tr><td><code>prcp_fac</code></td><td>未固定（由校准策略确定）</td><td>降水缩放因子</td><td>无量纲</td></tr>
+    <tr><td><code>temp_melt</code></td><td>-1.0</td><td>融化阈值温度</td><td>°C</td></tr>
+    <tr><td><code>temp_all_solid</code></td><td>0.0</td><td>全固态降水温度分界</td><td>°C</td></tr>
+    <tr><td><code>temp_all_liq</code></td><td>2.0</td><td>全液态降水温度分界</td><td>°C</td></tr>
+    <tr><td><code>temp_default_gradient</code></td><td>-0.0065</td><td>温度垂直递减率</td><td>K m<sup>-1</sup></td></tr>
+    <tr><td><code>geodetic_mb_period</code></td><td>2000-01-01_2020-01-01</td><td>大地测量物质平衡（geodetic mass balance）校准参考期</td><td>date range</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>8.9 总结</h2>
+
+<p>
+<code>massbalance.py</code> 是OGGM的核心模块：它将气候时间序列转换为冰川表面的质量收支，并把这些收支提供给反演和动力学模块。从线性理想模型到月度温度指数模型（MonthlyTIModel, temperature-index model），从单冰川校准到多流线分配，代码体现的是经验参数化、观测约束和数值效率之间的折中。
+</p>
+
+<p>
+掌握了物质平衡模型，下一章将进入冰厚反演：利用表观物质平衡（apparent mass balance）推导沿流线的冰通量，再结合SIA关系求解冰厚度和冰床高程。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch07.html">第7章：气候数据处理与Shop模块</a></span>
+  <span class="next"><a href="ch09.html">第9章：冰厚反演</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

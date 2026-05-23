@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第12章 崩解参数化 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第12章 崩解参数化</h1>
+
+<p>
+崩解（calving）是入海型冰川和冰架物质损失的主导过程——在这些环境中，气候驱动的表面消融远小于末端冰崖崩落和冰山产犊的质量损失。OGGM通过k-崩解定律和迭代一致性算法将这个过程参数化，使入海型冰川的反演和正演模拟能与陆地冰川共享同一个SIA动力框架。本章涵盖崩解的物理原理、在反演和正演中的双重应用、以及支撑模拟稳定性的桶形移除机制。
+</p>
+
+<div class="callout warning">
+  <div class="callout-title">崩解不是默认“万能开关”</div>
+  <p>入海型和湖泊终止冰川对水位、末端冰厚、水下地形和<code>calving_k</code>非常敏感。OGGM的k-崩解方案适合区域尺度参数化，但不能替代高分辨率冰崖断裂、海洋热强迫或水下地形观测。论文中使用崩解结果时，应说明是否启用了反演崩解、正演崩解以及所用<code>calving_k</code>。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>12.1 入海型冰川检测</h2>
+
+<p>
+OGGM通过RGI（Randolph Glacier Inventory）中的<code>TermType</code>属性判定冰川是否为入海型（tidewater）：
+</p>
+
+<pre><code><span class="cmt"># gdir.is_tidewater 来源于RGI的TermType字段</span>
+<span class="cmt"># TermType = 1: 陆地终止（land-terminating）</span>
+<span class="cmt"># TermType = 2: 海洋终止（marine-terminating）——入海型冰川</span>
+<span class="cmt"># TermType = 3: 冰架终止（shelf-terminating）——漂浮冰架</span>
+
+<span class="cmt"># cfg.PARAMS['tidewater_type'] 控制哪些类型被处理为入海型冰川</span>
+<span class="cmt"># 默认值: 2 （仅海洋终止），选项 2+3 = 5 （海洋+冰架）</span></code></pre>
+
+<p>
+全球RGI清单中约13%的冰川被标记为入海型冰川（tidewater glacier），但它们贡献了约40%的冰川质量损失（主要来自格陵兰、阿拉斯加、斯瓦尔巴和南极半岛的大型入海型冰川（tidewater glaciers））。正确处理这些冰川对OGGM的海平面贡献预测至关重要。
+</p>
+
+<!-- ================================================================== -->
+<h2>12.2 k-崩解定律</h2>
+
+<h3>12.2.1 物理基础</h3>
+
+<p>
+k-崩解定律（Oerlemans &amp; Nick 2005）将崩解通量与水深度和冰厚度参数化关联：
+</p>
+
+<pre><code><span class="cmt"># k-崩解定律（flowline.py 第1545行）</span>
+q_calving = k * water_depth * ice_thickness * width
+
+<span class="kw">其中:</span>
+  k            — 崩解速率常数 (a^-1)，默认 <span class="dec">0.6</span>
+  water_depth  — 水深 (m) = 水面高度 - 冰床高程（末端处）
+  ice_thickness — 末端处冰厚 (m)
+  width        — 末端宽度 (m)
+
+<span class="cmt"># 物理解释：</span>
+<span class="cmt"># 更深的水 -> 更大的浮力力矩 -> 更高的崩解率</span>
+<span class="cmt"># 更厚的冰 -> 更高的冰崖 -> 更多的重力驱动崩解</span>
+<span class="cmt"># k 集成了所有未分辨的物理过程（水温、裂缝深度等）</span></code></pre>
+
+<p>
+Oerlemans &amp; Nick (2005)提出的这个公式是基于对Hansbreen冰川（斯瓦尔巴）的观测，其中k值通过校准为~0.6 a<sup>-1</sup>。这个值在OGGM中被作为默认值，但可以通过<code>cfg.PARAMS['calving_k']</code>进行调整以适应不同地区的冰川。
+</p>
+
+<h3>12.2.2 关键参数</h3>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>默认值</th><th>作用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>calving_k</code></td><td>0.6</td><td>崩解速率常数 (a<sup>-1</sup>)，用于正演模拟</td></tr>
+    <tr><td><code>inversion_calving_k</code></td><td>可能不同于calving_k</td><td>反演中使用的k值（可独立设置）</td></tr>
+    <tr><td><code>use_kcalving_for_inversion</code></td><td>True/False</td><td>反演中是否启用崩解</td></tr>
+    <tr><td><code>use_kcalving_for_run</code></td><td>True/False</td><td>正演模拟中是否启用崩解</td></tr>
+    <tr><td><code>free_board_marine_terminating</code></td><td>[10, 50] m</td><td>海洋终止冰川的出水高度（freeboard）范围</td></tr>
+    <tr><td><code>calving_front_slope</code></td><td>变化</td><td>用于下游线延伸（downstream-line extension）的崩解前缘坡度</td></tr>
+    <tr><td><code>water_level</code></td><td>0（或诊断值）</td><td>参考水位线 (m a.s.l.)</td></tr>
+  </tbody>
+</table>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout expert">
+  <div class="callout-title">k值的区域依赖性</div>
+  <p>
+    k=0.6是一个全球平均值，但不同区域的入海型冰川可能有截然不同的崩解行为。阿拉斯加沿海冰川（高降水量、温暖海洋）通常崩解率更高（k~1.0-2.0），而南极的冷基冰川崩解率更低（k~0.2-0.5）。OGGM的设计允许通过配置文件或<code>gdir</code>级的校准来调整k值，但目前的默认版本使用全球统一值。区域特定的k值标定是一个活跃的研究前沿。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>12.3 FluxBasedModel中的崩解实现</h2>
+
+<h3>12.3.1 崩解条件</h3>
+
+<p>
+在FluxBasedModel的step方法中（第1913-1971行），崩解仅在以下条件同时满足时执行：
+</p>
+
+<ol>
+  <li>冰川末端格点（倒数第1或第2个有冰的格点）的冰床高度低于水面高度。</li>
+  <li>末端以上存在冰高于水面——即冰川在进入水面之前有足够的冰厚。</li>
+  <li><code>cfg.PARAMS['use_kcalving_for_run'] = True</code>。</li>
+</ol>
+
+<h3>12.3.2 崩解桶（calving bucket）累加器</h3>
+
+<p>
+崩解质量通过<code>calving_bucket_m3</code>累加器追踪：
+</p>
+
+<pre><code><span class="cmt"># 崩解桶（calving bucket）机制</span>
+<span class="kw">if</span> is_calving_position(i) <span class="kw">and</span> ice_above_water:
+    <span class="cmt"># 步骤1: 计算本步的崩解量</span>
+    q_calving = k * water_depth * thick * width
+    calving_volume = q_calving * dt    <span class="cmt"># 本步崩解体积 (m3)</span>
+
+    <span class="cmt"># 步骤2: 累加到崩解桶</span>
+    calving_bucket_m3 += calving_volume
+
+    <span class="cmt"># 步骤3: 检查是否可移除整个网格单元</span>
+    cell_volume = thick * width * dx
+    <span class="kw">if</span> calving_bucket_m3 &gt;= cell_volume:
+        <span class="cmt"># 移除一个完整的网格单元</span>
+        thick[i] = <span class="dec">0</span>
+        calving_bucket_m3 -= cell_volume
+        n_cells_removed += <span class="dec">1</span></code></pre>
+
+<h3>12.3.3 两阶段移除</h3>
+
+<p>
+<strong>阶段1（水下冰移除）</strong>：首先移除低于水面的冰部分。这些冰不满足静水压平衡——即浮力不足以支撑冰崖的高度。物理上这代表了由于浮力力矩导致的底部崩解。
+
+<strong>阶段2（完整网格单元移除）</strong>：当桶积累的崩解体积超过一个完整的网格单元体积时，移除整个单元。这是一种整数化的移除方案——因为OGGM的1D中心线模型不支持部分网格单元，崩解必须以整格点为单位执行。
+</p>
+
+<span class="tag tag-intermediate">中级</span>
+<div class="callout tip">
+  <div class="callout-title">为什么用桶而不是直接部分移除？</div>
+  <p>
+    直接部分移除（如减少一个格点30%的厚度）会导致：(1) 厚度空间不连续——一个格点突然变薄但相邻格点未变薄；(2) 表面梯度异常——格点间的急剧表面坡度变化可能触发下一次步的数值不稳定。桶机制（bucket mechanism）将崩解"储蓄"下来，只在积累够一个格子后才执行，保持了厚度场的空间光滑性，代价是崩解在时间上略有延迟（通常每个格点延迟1-10年的崩解量）。
+  </p>
+</div>
+
+<h3>12.3.4 诊断输出</h3>
+
+<pre><code><span class="cmt"># 每个时间步计算的诊断量</span>
+calving_m3_since_y0     <span class="cmt"># 从初始年到当前的累积崩解体积 (m3)</span>
+calving_rate_myr        <span class="cmt"># 等效崩解率 (m yr^-1)，用于与其他研究比较</span></code></pre>
+
+<p>
+<code>calving_rate_myr</code> 是将崩解体积转换为等效的末端后退率的指标——如果所有崩解都以末端后退（等宽）的形式发生，这个值就是末端的年均后退距离。
+</p>
+
+<!-- ================================================================== -->
+<h2>12.4 SemiImplicitModel中的崩解</h2>
+
+<p>
+半隐式方案中也包含了k-崩解定律的应用。不过由于半隐式方案使用隐式时间离散，崩解的实现细节有所不同：
+</p>
+
+<ul>
+  <li>崩解移除在执行三对角求解之前进行——因为移除的格子不参与隐式扩散系统。</li>
+  <li>半隐式的稳定性优势在这里体现——急剧的末端变化（崩解去除）不会触发CFL不稳定，因为隐式扩散步骤会自适应地处理新边界。</li>
+  <li>然而，半隐式方案仅支持单条流线——如果入海型冰川有多条支流，SemiImplicitModel无法处理支流合并，FluxBasedModel仍是唯一的选择。</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>12.5 崩解与冰床反演的耦合</h2>
+
+<h3>12.5.1 inversion.py中的崩解路径</h3>
+
+<p>
+在反演任务（workflow.py 约第546行）中，崩解冰川和非崩解冰川走不同的处理路径：
+</p>
+
+<pre><code><span class="cmt"># 反演任务分叉逻辑：</span>
+<span class="kw">if</span> gdir.is_tidewater <span class="kw">and</span> cfg.PARAMS[<span class="str">'use_kcalving_for_inversion'</span>]:
+    <span class="cmt"># 崩解路线：迭代一致性求解</span>
+    find_inversion_calving_from_any_mb(gdir, ...)
+<span class="kw">else</span>:
+    <span class="cmt"># 非崩解路线：标准SIA反演</span>
+    mass_conservation_inversion(gdir, ...)</code></pre>
+
+<h3>12.5.2 find_inversion_calving_from_any_mb（inversion.py:1033）</h3>
+
+<p>
+这是崩解-冰厚反演的迭代一致性求解器，解决了"先有鸡还是先有蛋"的问题：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">find_inversion_calving_from_any_mb</span>(<span class="dec">gdir</span>, ...):
+    <span class="cmt"># 迭代循环：</span>
+    <span class="kw">while</span> not_converged:
+        <span class="cmt"># 1. 从当前冰厚估计计算崩解通量</span>
+        q_calving = k * water_depth(h) * h * width
+
+        <span class="cmt"># 2. 将崩解通量加入物质平衡通量</span>
+        total_flux = mass_balance_flux + q_calving
+
+        <span class="cmt"># 3. 用修正的通量求解新的冰厚（SIA反演）</span>
+        h_new = mass_conservation_inversion(total_flux)
+
+        <span class="cmt"># 4. 检查收敛性</span>
+        <span class="kw">if</span> |h_new - h_old| &lt; tolerance:
+            converged = <span class="dec">True</span>
+        h_old = h_new
+
+    <span class="cmt"># 收敛时将崩解速率写入 gdir.inversion_calving_rate</span></code></pre>
+
+<p>
+迭代通常在5-10轮内收敛。收敛后，<code>gdir.inversion_calving_rate</code> 存储了在参考气候下末端处的崩解速率——这个值不仅用于正演模型初始化，也用于后续的动力学模拟一致性检查。
+</p>
+
+<h3>12.5.3 迭代收敛的物理含义</h3>
+
+<p>
+迭代收敛意味着"给定气候条件和冰川几何，从SIA厚度反算的崩解率与从崩解律和SIA厚度预测的崩解率一致"。换言之——冰厚、气候、崩解三者在物理上自洽。这种一致性是入海型冰川动态预热（dynamic spinup）的前提（见第13章），因为不一致的初始状态会在模拟中产生非物理的瞬态响应。
+</p>
+
+<!-- ================================================================== -->
+<h2>12.6 下游线（downstream line）延伸</h2>
+
+<h3>12.6.1 calving_glacier_downstream_line（flowline.py:3175）</h3>
+
+<p>
+入海型冰川需要将流线和冰床横截面（bed cross-section）几何延伸到水面以下，因为冰川末端的冰厚可能在当前末端位置之外继续存在（水下冰）。<code>calving_glacier_downstream_line</code> 函数按如下方式扩展床层几何：
+</p>
+
+<pre><code><span class="cmt"># 延伸逻辑：</span>
+<span class="kw">def</span> <span class="fn">calving_glacier_downstream_line</span>(<span class="dec">gdir</span>):
+    <span class="cmt"># 1. 从当前末端的冰床高程开始</span>
+    bed_start = flowline.bed_h[<span class="dec">-1</span>]
+    surface_start = flowline.surface_h[<span class="dec">-1</span>]
+
+    <span class="cmt"># 2. 使用 calving_front_slope 确定延伸趋势</span>
+    <span class="cmt">#    slope = cfg.PARAMS['calving_front_slope']</span>
+    bed_extension = np.linspace(bed_start, water_level - max_depth,
+                                 n_extension_points)
+
+    <span class="cmt"># 3. 确保延伸段在消融区</span>
+    <span class="cmt">#    添加足够多的格点使冰厚在延伸末端降为零</span></code></pre>
+
+<p>
+<code>calving_front_slope</code>参数控制了末端外冰床的坡度。如果不确定实际的水下地形（多数冰川缺乏实测测深数据），OGGM默认使用一个保守的浅坡度，这导致崩解前缘的冰厚适中，而非急剧的深水冰崖。
+</p>
+
+<h3>12.6.2 出水高度（freeboard）</h3>
+
+<p>
+<code>cfg.PARAMS['free_board_marine_terminating'] = [10, 50]</code> 定义了海洋终止冰川出水高度（freeboard）的可接受范围（水面以上的冰崖高度）。在反演和模型初始化中，出水高度（freeboard）被约束在这个范围内：
+</p>
+
+<pre><code><span class="cmt"># 出水高度（freeboard）约束</span>
+freeboard = surface_h[<span class="dec">-1</span>] - water_level
+<span class="kw">if</span> freeboard &lt; min_freeboard:   <span class="cmt"># 冰崖太低 → 易倾斜崩塌</span>
+    clip_thickness_at_terminus()
+<span class="kw">if</span> freeboard &gt; max_freeboard:   <span class="cmt"># 冰崖太高 → 物理不可支撑</span>
+    reduce_thickness_at_terminus()</code></pre>
+
+<p>
+下界10 m确保冰崖有足够的高度使重力崩解过程主导（而非被波浪和潮汐破坏）；上界50 m是力学稳定性的实用上限——高于50 m的冰崖在水面上由于冰的蠕变和裂缝不稳定难以长期存在。
+</p>
+
+<!-- ================================================================== -->
+<h2>12.7 水位确定</h2>
+
+<p>
+崩解计算中的水位可以来自多个来源，优先级从高到低为：
+</p>
+
+<ol>
+  <li><strong>反演诊断值</strong>：从<code>gdir.get_diagnostics()</code>获得的每个冰川的水位（如果之前校准过）。</li>
+  <li><strong>配置文件常数</strong>：<code>cfg.PARAMS['water_level']</code> 定义的全局恒定海平面（默认0 m）。</li>
+  <li><strong>气候驱动的海平面</strong>：耦合海平面预测的项目可能提供时间变化的水位。</li>
+</ol>
+
+<p>
+对于大多数RGI冰川，水位直接使用全球平均海平面（0 m），但格陵兰和南极半岛的冰川可能需要调整（由于后冰期回弹和区域海洋动力学的影响）。
+</p>
+
+<!-- ================================================================== -->
+<h2>12.8 崩解桶（calving bucket）设计模式详解</h2>
+
+<p>
+桶模式是OGGM崩解实现中最精巧的工程设计之一。核心思想：
+</p>
+
+<pre><code><span class="cmt"># 经典问题：</span>
+<span class="cmt"># q_calving = k * wd * h * w = 0.6 * 50m * 200m * 1000m = 6e6 m3/yr</span>
+<span class="cmt"># cell_volume = h * w * dx = 200m * 1000m * 100m = 2e7 m3</span>
+<span class="cmt"># 一年仅积累完整格子的30%，如何在不做部分移除的前提下处理？</span>
+
+<span class="cmt"># 桶方案：</span>
+<span class="cmt"># 年1: bucket = 6e6 m3 （不够一个格子） → 不移除</span>
+<span class="cmt"># 年2: bucket = 12e6 m3 → 不移除</span>
+<span class="cmt"># 年3: bucket = 18e6 m3 → 不移除</span>
+<span class="cmt"># 年4: bucket = 24e6 m3 → bucket > 20e6 → 移除1格，bucket = 4e6</span></code></pre>
+
+<p>
+这个方案保证了：
+</p>
+<ul>
+  <li><strong>整数性</strong>：从不出现"半格"的情况。</li>
+  <li><strong>长期守恒</strong>：多年平均的移除量精确匹配崩解公式的预测。</li>
+  <li><strong>空间光滑</strong>：移除发生在末端格点，厚度突变不扩展到上游。</li>
+</ul>
+
+<p>
+缺点是短期（1-5年）的末端位置可能有1-2个格点的"锯齿"——某些年份无后退，某些年份后退2个格点。但对于OGGM的典型应用（10-100年尺度），这种短期波动在研究结果中是不可分辨的。
+</p>
+
+<!-- ================================================================== -->
+<h2>12.9 calving_mb函数（massbalance.py:1437）</h2>
+
+<p>
+<code>calving_mb</code> 将崩解通量转换为"等效物质平衡"的形式，用于在MB模型中统一表示所有的质量损失：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">calving_mb</span>(<span class="dec">gdir</span>):
+    <span class="cmt"># 将崩解通量 (m3 s^-1) 转换为等效MB (kg m^-2 yr^-1)</span>
+    <span class="cmt"># calving_mb = calving_flux * rho / glacier_area</span>
+    <span class="cmt"># 使崩解损失与表面消融损失可以统一求和</span></code></pre>
+
+<p>
+这个转换使得冰川总物质平衡可以被表达为一个单一数字——表面MB加上崩解通量，便于与其他模型和观测进行比较。
+</p>
+
+<!-- ================================================================== -->
+<h2>12.10 配置参数全表</h2>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>默认值</th><th>位置</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>calving_k</code></td><td>0.6</td><td>cfg.PARAMS</td><td>正演崩解速率常数 (a<sup>-1</sup>)</td></tr>
+    <tr><td><code>inversion_calving_k</code></td><td>0.6</td><td>cfg.PARAMS</td><td>反演崩解速率常数 (a<sup>-1</sup>)</td></tr>
+    <tr><td><code>use_kcalving_for_inversion</code></td><td>False</td><td>cfg.PARAMS</td><td>反演是否考虑崩解；默认关闭，预处理脚本或入海型实验可显式开启</td></tr>
+    <tr><td><code>use_kcalving_for_run</code></td><td>False</td><td>cfg.PARAMS</td><td>正演是否考虑崩解；默认关闭，需在入海型正演实验中显式开启</td></tr>
+    <tr><td><code>free_board_marine_terminating</code></td><td>[10, 50]</td><td>cfg.PARAMS</td><td>出水高度（freeboard）范围 (m)</td></tr>
+    <tr><td><code>calving_front_slope</code></td><td>0.05</td><td>cfg.PARAMS</td><td>崩解前缘坡度 (m/m)</td></tr>
+    <tr><td><code>water_level</code></td><td>0</td><td>cfg.PARAMS</td><td>参考水位线 (m a.s.l.)</td></tr>
+    <tr><td><code>tidewater_type</code></td><td>2</td><td>cfg.PARAMS</td><td>入海型冰川类型过滤</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>12.11 总结</h2>
+
+<p>
+OGGM的崩解参数化以Oerlemans &amp; Nick (2005)的k-崩解定律为核心，通过迭代一致性求解器将崩解损失纳入冰厚反演，再通过崩解桶（calving bucket）机制在正演模型中保证质量守恒和数值光滑。出水高度（freeboard）的约束和水位确定机制进一步确保了崩解过程在物理上有意义。
+</p>
+
+<p>
+虽然k=0.6的全球统一值与各区域的真实崩解行为之间存在系统性偏差，OGGM的模块化设计允许通过参数文件和gdir级诊断来区域化校准——这一灵活性与SIA动力框架的简洁性相结合，使入海型冰川的质量损失在OGGM预测量级中得到了合理的表示。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch11.html">第11章：数值方法详解</a></span>
+  <span class="next"><a href="ch13.html">第13章：动态Spinup与模型初始化</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

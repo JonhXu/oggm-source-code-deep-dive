@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>附录B 参数参考手册 — OGGM 源码深度解析</title>
+<style>
+:root {
+  --bg: #fffdf8; --fg: #1a1a1a; --accent: #2c5f8a; --accent-light: #e8f0f7;
+  --code-bg: #f4f4f4; --border: #ddd;
+}
+body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg); line-height: 1.7; }
+h1 { font-size: 2rem; color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: .4rem; margin-top: 2.5rem; }
+h2 { font-size: 1.55rem; color: #1e4a6b; border-bottom: 2px solid #c8d8e8; padding-bottom: .25rem; margin-top: 2.2rem; }
+h3 { font-size: 1.25rem; color: #2c5f8a; margin-top: 1.6rem; }
+h4 { font-size: 1.1rem; color: #444; margin-top: 1.2rem; }
+p { margin: .8rem 0; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: .9rem; line-height: 1.5; }
+code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88em; background: #eee; padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+thead { background: var(--accent); color: #fff; }
+th, td { padding: .5rem .6rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+tbody tr:nth-child(even) { background: #f9f9f9; }
+.chapter-nav { display: flex; justify-content: space-between; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.chapter-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+footer { text-align: center; color: #888; font-size: .85rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.param-default { font-family: monospace; font-weight: bold; color: #0a5; }
+.param-type { font-family: monospace; color: #666; font-size: .88em; }
+</style>
+</head>
+<body>
+
+<h1>附录B 参数参考手册</h1>
+
+<p>
+本附录汇总OGGM <code>params.cfg</code> 与常用运行参数中的核心配置项。参数控制着从文件路径和网格分辨率到
+冰动力学常数和崩解法则等各个方面。每个条目包含参数名称、类型、默认值、
+中文描述以及常见使用模块；少数只作为函数调用参数出现的条目会在描述中说明。
+</p>
+
+<div class="callout" style="background: #e8f0f7; border-left: 5px solid #2c5f8a; padding: .75rem 1rem; border-radius: 6px; margin: 1rem 0;">
+<span class="callout-title" style="font-weight: 700;">参数继承</span>
+参数可以从三个位置设置，优先级如下：(1) 环境变量
+(<code>OGGM_<em>PARAMNAME</em></code>), (2) 用户提供的 <code>params.cfg</code> 文件,
+(3) OGGM内置默认值。具有最高优先级的值胜出。
+</div>
+
+<div class="callout" style="background: #fff3cd; border-left: 5px solid #e6b422; padding: .75rem 1rem; border-radius: 6px; margin: 1rem 0;">
+<span class="callout-title" style="font-weight: 700;">哪些参数可以先不碰</span>
+初学者通常只需要设置<code>working_dir</code>、<code>use_multiprocessing</code>、<code>border</code>、<code>baseline_climate</code>和运行函数的时间范围。<code>glen_a</code>、<code>fs</code>、<code>calving_k</code>、<code>cfl_number</code>等会直接改变物理或数值行为，应作为敏感性实验的一部分修改，并在结果中报告。
+</div>
+
+<!-- ================================================================== -->
+<h2>B.1 输入输出与路径</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>working_dir</code></td><td class="param-type">str</td><td class="param-default">~/.oggm</td><td>所有OGGM数据的根目录。冰川目录（GlacierDirectory）位于 <code>working_dir/per_glacier/</code> 下。</td><td>cfg, GlacierDirectory, workflow</td></tr>
+<tr><td><code>dl_verify</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>如为True，验证下载文件的校验和。</td><td>utils, shop模块</td></tr>
+<tr><td><code>use_sample_data</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>如为True，使用oggm-sample-data进行测试和演示，而非下载完整数据集。</td><td>tests, utils</td></tr>
+<tr><td><code>tmp_dir</code></td><td class="param-type">str</td><td class="param-default">~/.oggm_tmp</td><td>用于中间处理文件的临时目录。</td><td>cfg, gis</td></tr>
+<tr><td><code>cache_dir</code></td><td class="param-type">str</td><td class="param-default">~/.oggm_cache</td><td>下载的DEM瓦片、气候数据和RGI文件的缓存目录。</td><td>cfg, shop, gis</td></tr>
+<tr><td><code>rgi_version</code></td><td class="param-type">str</td><td class="param-default">62</td><td>使用的RGI版本（62表示RGI 6.2；RGI 7在预处理脚本中通常用70G/70C等标识）。</td><td>workflow, GlacierDirectory</td></tr>
+<tr><td><code>use_rgi_area</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>如为True，使用RGI报告的面积。如为False，从局部网格计算面积。</td><td>gis, centerlines</td></tr>
+<tr><td><code>use_intersects</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>如为True，在处理中包含相交冰川（针对具有相交关系的RGI区域）。</td><td>gis</td></tr>
+<tr><td><code>clip_intersects</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>如为True，将相交冰川轮廓裁剪到主冰川的集水区。</td><td>gis</td></tr>
+<tr><td><code>min_glacier_area_km2</code></td><td class="param-type">float</td><td class="param-default">0.01</td><td>处理的最小冰川面积（km²）。更小的冰川将被跳过。</td><td>workflow</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.2 多进程</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>use_multiprocessing</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>启用实体任务（entity task）的并行执行；正式批处理时通常显式开启。</td><td>workflow, execute_entity_task</td></tr>
+<tr><td><code>mp_processes</code></td><td class="param-type">int</td><td class="param-default">-1</td><td>多进程的进程数。-1表示使用所有可用CPU。</td><td>workflow</td></tr>
+<tr><td><code>continue_on_error</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>如为True，当某个冰川失败时继续处理其他冰川。如为False，立即抛出异常。</td><td>entity_task</td></tr>
+<tr><td><code>log_history_level</code></td><td class="param-type">str</td><td class="param-default">INFO</td><td>任务历史记录的日志级别（工作流日志）。</td><td>cfg, workflow</td></tr>
+<tr><td><code>show_progress</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>在实体任务（entity task）执行期间显示进度条。</td><td>workflow</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.3 网格与地图</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>grid_dx_method</code></td><td class="param-type">str</td><td class="param-default">square</td><td>从冰川面积计算网格分辨率的方法。可选值包括'fixed'、'by_bin'、'linear'、'square'。</td><td>gis (define_glacier_region)</td></tr>
+<tr><td><code>map_proj</code></td><td class="param-type">str</td><td class="param-default">tmerc</td><td>局部地图投影类型：'tmerc'（横轴墨卡托）或'utm'。</td><td>gis</td></tr>
+<tr><td><code>border</code></td><td class="param-type">int</td><td class="param-default">80</td><td>局地地图在冰川边界外保留的像素宽度。过去模拟或冰川前进实验通常需要更大的边界。</td><td>gis, workflow</td></tr>
+<tr><td><code>clip_tidewater_border</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>对入海型冰川限制过大的局地地图边界，以减少不必要的海域网格。</td><td>gis</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.4 中心线与流线</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>use_multiple_flowlines</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>如为True，分别对每条中心线分支建模。如为False，将支流合并为一条。</td><td>centerlines, flowline</td></tr>
+<tr><td><code>localmax_window</code></td><td class="param-type">float</td><td class="param-default">500.</td><td>寻找冰川头部局地高程极大值时使用的半窗口大小（m）。</td><td>centerlines</td></tr>
+<tr><td><code>smooth_window</code></td><td class="param-type">float</td><td class="param-default">251.</td><td>DEM平滑窗口大小（m）；设为0表示不平滑。</td><td>gis, centerlines</td></tr>
+<tr><td><code>q1, q2, rmax</code></td><td class="param-type">float</td><td class="param-default">2e-6, 500., 1000.</td><td>Kienholz等中心线算法中的头部候选点和路线代价参数。</td><td>centerlines</td></tr>
+<tr><td><code>f1, f2, a, b</code></td><td class="param-type">float</td><td class="param-default">1000., 3000., 4.25, 3.7</td><td>Kienholz等中心线算法中的代价函数参数。</td><td>centerlines</td></tr>
+<tr><td><code>kbuffer</code></td><td class="param-type">float</td><td class="param-default">2.5</td><td>在汇流处裁剪支流中心线的缓冲距离（像素）。</td><td>centerlines</td></tr>
+<tr><td><code>terminus_search_percentile</code></td><td class="param-type">int</td><td class="param-default">10</td><td>水体终止冰川寻找末端高程时使用的百分位数；0表示不启用特殊处理。</td><td>centerlines</td></tr>
+<tr><td><code>terminus_search_altitude_range</code></td><td class="param-type">float</td><td class="param-default">100</td><td>水体终止冰川末端搜索允许的高程范围（m）。</td><td>centerlines</td></tr>
+<tr><td><code>flowline_dx</code></td><td class="param-type">int</td><td class="param-default">2</td><td>流线网格间距，以局地地图像素为单位。</td><td>centerlines, flowline</td></tr>
+<tr><td><code>flowline_junction_pix</code></td><td class="param-type">int</td><td class="param-default">3</td><td>在流线汇合处任意裁剪的像素数，用于避免交汇处几何重叠。</td><td>centerlines</td></tr>
+<tr><td><code>flowline_height_smooth</code></td><td class="param-type">float</td><td class="param-default">1</td><td>沿流线高程的高斯平滑尺度（像素）。</td><td>centerlines</td></tr>
+<tr><td><code>filter_min_slope</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>是否过滤过小坡度；与<code>min_slope</code>共同影响流线坡度处理。</td><td>centerlines</td></tr>
+<tr><td><code>elevation_band_flowline_binsize</code></td><td class="param-type">float</td><td class="param-default">30</td><td>高程带流线（elevation-band flowline）定义使用的海拔分段大小（m）。</td><td>centerlines</td></tr>
+<tr><td><code>width_alt_range_thres</code></td><td class="param-type">float</td><td class="param-default">250.</td><td>宽度计算中用于筛选高程范围的阈值。</td><td>centerlines</td></tr>
+<tr><td><code>min_n_per_bin</code></td><td class="param-type">int</td><td class="param-default">2</td><td>高度-面积分布每个分箱所需的最少元素数。</td><td>centerlines</td></tr>
+<tr><td><code>base_binsize</code></td><td class="param-type">float</td><td class="param-default">50.</td><td>高度-面积分布的基准分箱大小（m）。</td><td>centerlines</td></tr>
+<tr><td><code>smooth_widths_window_size</code></td><td class="param-type">int</td><td class="param-default">1</td><td>宽度平滑窗口；0表示不平滑，1表示默认平滑。</td><td>centerlines</td></tr>
+<tr><td><code>downstream_line_shape</code></td><td class="param-type">str</td><td class="param-default">trapezoidal</td><td>冰川下游无冰延伸线的冰床形状，可为<code>parabola</code>或<code>trapezoidal</code>。</td><td>centerlines, flowline</td></tr>
+<tr><td><code>trapezoid_min_bottom_width</code></td><td class="param-type">float</td><td class="param-default">50.</td><td>梯形下游线允许的最小底宽（m）。</td><td>flowline</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.5 气候</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>baseline_climate</code></td><td class="param-type">str</td><td class="param-default">GSWP3_W5E5</td><td>基线气候数据源：'CRU', 'HISTALP', 'ERA5', 'ERA5L', 'W5E5', 'GSWP3_W5E5'等。</td><td>climate (分派器)</td></tr>
+<tr><td><code>temp_default_gradient</code></td><td class="param-type">float</td><td class="param-default">-0.0065</td><td>默认大气温度递减率（K/m，等价于-6.5 K/km）。</td><td>climate</td></tr>
+<tr><td><code>temp_melt</code></td><td class="param-type">float</td><td class="param-default">-1.0</td><td>融化计算使用的温度阈值（°C）。</td><td>massbalance</td></tr>
+<tr><td><code>temp_all_solid</code></td><td class="param-type">float</td><td class="param-default">0.0</td><td>低于此温度阈值（°C）的所有降水为固态。</td><td>massbalance</td></tr>
+<tr><td><code>temp_all_liq</code></td><td class="param-type">float</td><td class="param-default">2.0</td><td>高于此温度阈值（°C）的所有降水为液态。</td><td>massbalance</td></tr>
+<tr><td><code>melt_f</code></td><td class="param-type">float</td><td class="param-default">5</td><td>温度指数融化因子（temperature-index melt factor；kg m⁻² K⁻¹ day⁻¹），校准时可更新。</td><td>massbalance</td></tr>
+<tr><td><code>melt_f_min</code></td><td class="param-type">float</td><td class="param-default">1.5</td><td>校准融化因子时允许的下界。</td><td>massbalance</td></tr>
+<tr><td><code>melt_f_max</code></td><td class="param-type">float</td><td class="param-default">17</td><td>校准融化因子时允许的上界。</td><td>massbalance</td></tr>
+<tr><td><code>temp_bias_min</code></td><td class="param-type">float</td><td class="param-default">-15</td><td>温度偏差校准允许的下界（°C）。</td><td>massbalance</td></tr>
+<tr><td><code>temp_bias_max</code></td><td class="param-type">float</td><td class="param-default">15</td><td>温度偏差校准允许的上界（°C）。</td><td>massbalance</td></tr>
+<tr><td><code>prcp_fac</code></td><td class="param-type">float/None</td><td class="param-default">None</td><td>降水缩放因子；为空时由相关校准逻辑决定。</td><td>massbalance</td></tr>
+<tr><td><code>prcp_fac_min</code></td><td class="param-type">float</td><td class="param-default">0.1</td><td>降水缩放因子校准允许的下界。</td><td>massbalance</td></tr>
+<tr><td><code>prcp_fac_max</code></td><td class="param-type">float</td><td class="param-default">10</td><td>降水缩放因子校准允许的上界。</td><td>massbalance</td></tr>
+<tr><td><code>geodetic_mb_period</code></td><td class="param-type">str</td><td class="param-default">2000-01-01_2020-01-01</td><td>逐冰川匹配大地测量物质平衡（geodetic mass balance）时使用的参考期。</td><td>massbalance</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.6 冰动力学</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>glen_a</code></td><td class="param-type">float</td><td class="param-default">2.4e-24</td><td>Glen流动定律的速率因子A（s⁻¹ Pa⁻³）。控制冰的变形能力。</td><td>flowline, inversion</td></tr>
+<tr><td><code>glen_n</code></td><td class="param-type">int</td><td class="param-default">3</td><td>Glen流动定律的指数n（无量纲）。</td><td>flowline, inversion</td></tr>
+<tr><td><code>fs</code></td><td class="param-type">float</td><td class="param-default">0</td><td>滑动参数 f_s（无量纲）。0 = 无滑动，1 = 最大滑动。</td><td>flowline, inversion</td></tr>
+<tr><td><code>inversion_glen_a</code></td><td class="param-type">float</td><td class="param-default">2.4e-24</td><td>反演中专门使用的Glen A值（可与演化计算不同）。</td><td>inversion</td></tr>
+<tr><td><code>inversion_fs</code></td><td class="param-type">float</td><td class="param-default">0</td><td>反演中专门使用的滑动参数。</td><td>inversion</td></tr>
+<tr><td><code>ice_density</code></td><td class="param-type">float</td><td class="param-default">900</td><td>冰密度（kg m⁻³）。</td><td>flowline, inversion</td></tr>
+<tr><td><code>mixed_min_shape</code></td><td class="param-type">float</td><td class="param-default">0.001</td><td>混合冰床横截面（bed cross-section）的最小形状参数，用于避免反演中出现退化横截面。</td><td>inversion</td></tr>
+<tr><td><code>cfl_number</code></td><td class="param-type">float</td><td class="param-default">0.02</td><td>流线求解器中自适应时间步长的CFL数。</td><td>flowline</td></tr>
+<tr><td><code>cfl_min_dt</code></td><td class="param-type">float</td><td class="param-default">60</td><td>CFL自适应步长允许的最小子步长（秒）。</td><td>flowline</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.7 崩解与入海型冰川</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>use_kcalving_for_run</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>为入海型冰川启用k-崩解参数化。默认关闭，需在入海型冰川实验中显式开启。</td><td>flowline</td></tr>
+<tr><td><code>use_kcalving_for_inversion</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>在反演中对入海型冰川应用崩解校正。默认关闭，开启后需配合入海型冰川预处理和水位约束。</td><td>inversion</td></tr>
+<tr><td><code>calving_k</code></td><td class="param-type">float</td><td class="param-default">0.6</td><td>水深依赖型崩解法则中的崩解速率常数k（yr⁻¹）。</td><td>flowline</td></tr>
+<tr><td><code>inversion_calving_k</code></td><td class="param-type">float</td><td class="param-default">0.6</td><td>厚度反演阶段使用的崩解速率常数（yr⁻¹）。</td><td>inversion</td></tr>
+<tr><td><code>calving_use_limiter</code></td><td class="param-type">bool</td><td class="param-default">True</td><td>对崩解通量使用限制器，以避免末端冰厚和通量出现数值不稳定。</td><td>flowline</td></tr>
+<tr><td><code>free_board_marine_terminating</code></td><td class="param-type">tuple</td><td class="param-default">10, 50</td><td>入海型冰川反演中允许的出水高度（freeboard）范围（m）。</td><td>inversion</td></tr>
+<tr><td><code>free_board_lake_terminating</code></td><td class="param-type">float</td><td class="param-default">10</td><td>湖泊终止冰川使用的出水高度（freeboard）（m）。</td><td>inversion</td></tr>
+<tr><td><code>calving_line_extension</code></td><td class="param-type">int</td><td class="param-default">30</td><td>为崩解前缘向水体方向延伸的网格点数。</td><td>centerlines, inversion</td></tr>
+<tr><td><code>calving_front_slope</code></td><td class="param-type">float</td><td class="param-default">0.05</td><td>崩解前缘外侧水下床面坡度，按tan(alpha)表示。</td><td>centerlines, inversion</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.8 输出控制</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>描述</th><th>使用者</th></tr></thead>
+<tbody>
+<tr><td><code>store_diagnostic_variables</code></td><td class="param-type">list</td><td class="param-default">volume, volume_bsl, ...</td><td>模型运行期间要写入诊断文件的变量列表。</td><td>flowline</td></tr>
+<tr><td><code>store_model_geometry</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>将完整模型几何（所有网格点的表面、冰床、厚度）保存为NetCDF格式。</td><td>flowline</td></tr>
+<tr><td><code>store_fl_diagnostics</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>在模型运行期间存储每条流线的诊断变量。该输出很占磁盘，通常只在诊断或教学中开启。</td><td>flowline</td></tr>
+<tr><td><code>store_fl_diagnostic_variables</code></td><td class="param-type">list</td><td class="param-default">area, thickness, ...</td><td>启用流线诊断输出时写入的变量列表。</td><td>flowline</td></tr>
+<tr><td><code>evolution_model</code></td><td class="param-type">str</td><td class="param-default">SemiImplicit</td><td>配置文件默认使用的流线演化求解器。参见第20章自定义模型注册。</td><td>flowline</td></tr>
+<tr><td><code>store_monthly_step</code></td><td class="param-type">bool</td><td class="param-default">False</td><td>运行函数参数；如为True，以月度分辨率写出诊断变量，输出量会显著增大。</td><td>run_* task</td></tr>
+<tr><td><code>dynamic_spinup_min_ice_thick</code></td><td class="param-type">float</td><td class="param-default">2.0</td><td>动态预热（dynamic spinup）中允许保留的最小冰厚阈值（m），用于避免极薄冰带导致的数值问题。</td><td>flowline, dynamic_spinup</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.9 诊断变量（详细）</h2>
+<!-- ================================================================== -->
+
+<p>模型运行期间存储的标准诊断变量集（启用时）：</p>
+
+<table>
+<thead><tr><th>变量</th><th>描述</th><th>单位</th><th>是否按流线？</th></tr></thead>
+<tbody>
+<tr><td><code>volume_m3</code></td><td>冰川冰总体积</td><td>m³</td><td>是</td></tr>
+<tr><td><code>area_m2</code></td><td>冰川表面积</td><td>m²</td><td>是</td></tr>
+<tr><td><code>length_m</code></td><td>冰川长度（沿主流线）</td><td>m</td><td>是</td></tr>
+<tr><td><code>ela_m</code></td><td>平衡线高度</td><td>m a.s.l.</td><td>否</td></tr>
+<tr><td><code>calving_m3</code></td><td>年度崩解通量</td><td>m³ yr⁻¹</td><td>是</td></tr>
+<tr><td><code>dmdtda_mmwea</code></td><td>比物质平衡速率</td><td>mm w.e. yr⁻¹</td><td>否</td></tr>
+<tr><td><code>terminus_thick_m</code></td><td>末端冰厚度</td><td>m</td><td>是</td></tr>
+<tr><td><code>calving_rate_myr</code></td><td>末端崩解速率</td><td>m yr⁻¹</td><td>是</td></tr>
+<tr><td><code>surface_h</code></td><td>表面高程剖面（如果 <code>store_model_geometry</code>）</td><td>m a.s.l.</td><td>是</td></tr>
+<tr><td><code>bed_h</code></td><td>冰床高程剖面（如果 <code>store_model_geometry</code>）</td><td>m a.s.l.</td><td>是</td></tr>
+<tr><td><code>thickness_m</code></td><td>冰厚度剖面（如果 <code>store_model_geometry</code>）</td><td>m</td><td>是</td></tr>
+<tr><td><code>ice_velocity_myr</code></td><td>表面冰流速（如果 <code>store_model_geometry</code>）</td><td>m yr⁻¹</td><td>是</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>B.10 交叉引用：参数与模块</h2>
+<!-- ================================================================== -->
+
+<table>
+<thead><tr><th>模块</th><th>关键参数</th></tr></thead>
+<tbody>
+<tr><td><code>oggm.cfg</code></td><td>working_dir, tmp_dir, cache_dir, use_sample_data, dl_verify, dl_retries</td></tr>
+<tr><td><code>oggm.workflow</code></td><td>use_multiprocessing, mp_processes, continue_on_error, show_progress, rgi_version, min_glacier_area_km2</td></tr>
+<tr><td><code>oggm.core.gis</code></td><td>grid_dx_method, dem_source, border_km, map_proj, use_intersects, use_rgi_area, use_local_dem_cache</td></tr>
+<tr><td><code>oggm.core.centerlines</code></td><td>use_multiple_flowlines, localmax_window, q1, q2, rmax, f1, f2, flowline_dx, downstream_line_shape</td></tr>
+<tr><td><code>oggm.core.climate / massbalance</code></td><td>baseline_climate, temp_default_gradient, temp_melt, temp_all_solid, temp_all_liq, melt_f, prcp_fac, geodetic_mb_period</td></tr>
+<tr><td><code>oggm.core.massbalance</code></td><td>temp_melt, temp_all_solid, temp_all_liq</td></tr>
+<tr><td><code>oggm.core.inversion</code></td><td>glen_a, glen_n, fs, inversion_glen_a, inversion_fs, mixed_min_shape, use_kcalving_for_inversion, inversion_calving_k</td></tr>
+<tr><td><code>oggm.core.flowline</code></td><td>glen_a, glen_n, fs, ice_density, cfl_number, cfl_min_dt, use_kcalving_for_run, calving_k, calving_use_limiter, evolution_model</td></tr>
+</tbody>
+</table>
+
+<div class="chapter-nav">
+  <a href="appendix_a.html">← 附录A API参考</a>
+  <a href="appendix_c.html">附录C 文件格式参考 →</a>
+</div>
+
+<footer>
+  OGGM 源码深度解析 &mdash; 附录B 参数参考手册
+</footer>
+
+</body>
+</html>

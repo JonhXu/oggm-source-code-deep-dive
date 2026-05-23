@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第11章 数值方法详解 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第11章 数值方法详解</h1>
+
+<p>
+第10章从类层级和算法架构的角度描述了OGGM的动力学模型。本章深入到数值细节——SIA方程的离散化、两种时间步进方案的稳定性分析、交错网格的设计原理、以及冰速计算和通量合并的数学基础。理解这些数值方法对于调试模拟异常、解释模型行为以及实现自定义动力学方案至关重要。
+</p>
+
+<div class="callout tip">
+  <div class="callout-title">第一遍可以怎么读</div>
+  <p>如果你的目标是先完成OGGM应用，可以先读11.1、11.2和11.5，理解SIA、求解器选择和时间步长。矩阵求解、交错网格和扩散率推导是解释数值异常或开发模型时才需要深入掌握的内容。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>11.1 浅冰近似（SIA）在OGGM中的应用</h2>
+
+<h3>11.1.1 完整的SIA方程</h3>
+
+<p>
+浅冰近似是冰川动力学的零阶近似，假设冰厚远小于水平范围，且侧向应力梯度可忽略。完整的SIA深度平均速度表达式为：
+</p>
+
+<pre><code><span class="cmt"># 深度平均冰流速度（SIA）</span>
+u_bar = -<span class="dec">2</span> * A * (rho * g)^<span class="dec">n</span> / (<span class="dec">n</span> + <span class="dec">2</span>)
+      * |grad(S)|^(<span class="dec">n</span> - <span class="dec">1</span>)
+      * grad(S)
+      * H^(<span class="dec">n</span> + <span class="dec">1</span>)
+
+<span class="kw">其中:</span>
+  A   = glen_a  — Glen流动律参数 (Pa^-n s^-1)
+  rho = <span class="dec">900</span>    — 冰密度 (kg m^-3)
+  g   = <span class="dec">9.81</span>   — 重力加速度 (m s^-2)
+  n   = <span class="dec">3</span>      — Glen指数
+  S   = bed_h + H  — 冰表面高程 (m)
+  H   = 冰厚 (m)</code></pre>
+
+<p>
+Glen流动律是这个方程组的物理基础：
+</p>
+
+<pre><code><span class="cmt"># Glen流动律（Norton-Hoff定律）</span>
+epsilon_dot = A * tau^<span class="dec">n</span>
+
+<span class="kw">其中:</span>
+  epsilon_dot — 有效应变率 (s^-1)
+  tau         — 有效剪应力 (Pa)
+  n           — 应力指数，标准冰川学值 = <span class="dec">3</span></code></pre>
+
+<p>
+<strong>n = 3</strong> 意味着冰的黏度随应力的三次方变化——三倍的应力导致27倍的应变率。这种强烈的非线性是冰川动力学的核心特征：流速对厚度和表面坡度高度敏感。
+</p>
+
+<h3>11.1.2 SIA的有效性范围</h3>
+
+<p>
+SIA的数学推导基于<strong>小纵横比假设</strong>：冰厚H远小于水平尺度L，即H/L（纵横比）小到可以忽略纵向应力梯度。这在下列条件下成立：
+</p>
+
+<ul>
+  <li>冰川长度 >> 冰厚（典型的山谷冰川纵横比约0.01-0.05）</li>
+  <li>表面坡度变化足够平缓</li>
+  <li>冰床不在反向坡度上（否则纵向应力重要）</li>
+  <li>无显著的侧向速度梯度</li>
+</ul>
+
+<p>
+在冰架（漂浮冰）、冰瀑（陡峭地形）或接地线附近，SIA的近似失效，需要更复杂的"高阶"模型。但OGGM的设计目标就是以SIA为物理基础，用经验修正弥补其不足。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.2 显式方案与半隐式方案的对比</h2>
+
+<h3>11.2.1 FluxBasedModel：向前欧拉</h3>
+
+<p>
+FluxBasedModel使用显式的向前欧拉时间离散：
+</p>
+
+<pre><code><span class="cmt"># 显式向前欧拉：H^(k+1) = H^(k) + dt * [MB - div(q)]</span>
+<span class="cmt"># 其中 div(q) = (q[i+1/2] - q[i-1/2]) / dx</span>
+<span class="cmt"># q 在交错格点上计算（使用当前时刻的H和S）</span></code></pre>
+
+<p>
+显式方案的两大限制：
+</p>
+
+<ol>
+  <li><strong>时间步长限制</strong> —— CFL条件 <code>u * dt / dx &lt; cfl_max</code>。对于流速100 m/yr、网格200 m、CFL=0.02的情况，dt约0.05年。高流速或细网格需要更多子步。</li>
+  <li><strong>无条件扩散不稳定</strong> —— 当扩散项占主导时（厚冰 + 陡坡），即使CFL数满足名义值，向前欧拉法仍可能表现出高频空间振荡。这是显式扩散格式的固有问题。</li>
+</ol>
+
+<p>
+稳定性分析（von Neumann）表明，对于纯对流（fs=0且低n），向前欧拉的放大因子为<code>|G| = |1 - i*u*dt/dx*sin(k*dx)|</code>，稳定条件为<code>|G| &lt;= 1</code>，直接导出CFL约束。
+</p>
+
+<h3>11.2.2 SemiImplicitModel：类Crank-Nicolson格式</h3>
+
+<p>
+SemiImplicitModel将SIA重新表述为扩散问题：
+</p>
+
+<pre><code><span class="cmt"># SIA扩散形式：dH/dt = MB + div(D * grad(S))</span>
+<span class="cmt"># 其中 D = gamma * H^(n+2) * |grad(S)|^(n-1) 是扩散系数</span>
+<span class="cmt"># gamma = 2*A*(rho*g)^n / (n+2)</span>
+
+<span class="cmt"># 半隐式离散：</span>
+<span class="cmt"># H^(k+1) = H^(k) + dt*MB + dt*div(D^(k)*grad(S^(k+1)))</span>
+<span class="cmt"># 在新表面S^(k+1)的梯度上使用隐式处理</span></code></pre>
+
+<p>
+CFL条件从<strong>对流</strong>（u*dt/dx）变为<strong>扩散</strong>（D*dt/dx^2），容许的时间步长大幅增加：
+</p>
+
+<pre><code><span class="cmt"># FluxBased： dt &lt;= 0.02 * dx / u     —— 对 dx 线性缩放</span>
+<span class="cmt"># SemiImplicit：dt &lt;= 0.50 * dx^2 / D  —— 对 dx 平方缩放</span>
+
+<span class="cmt"># 当 dx 较大时（>200 m），半隐式的优势十分明显</span></code></pre>
+
+<span class="tag tag-intermediate">中级</span>
+<div class="callout tip">
+  <div class="callout-title">何时选择哪个方案</div>
+  <p>
+    <strong>选择FluxBased</strong>：有支流系统（tributary system）时需要合并多条流线；需要显式通量诊断或崩解相关处理；低分辨率但大量的冰川集合模拟中计算成本可接受。注意OGGM v1.6.3配置文件默认<code>evolution_model</code>为<code>SemiImplicit</code>。<br>
+    <strong>选择SemiImplicit</strong>：单条流线的精细研究；需要高空间分辨率（dx &lt; 100 m）以避免过多的子步；需要严格数值稳定性（如含有急剧坡度变化的冰床横截面（bed cross-section））。<br>
+    <strong>常见权衡</strong>：每步计算成本——FluxBased约O(nx)，SemiImplicit约O(nx)（三对角求解为线性），但FluxBased需要更多的步数。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>11.3 交错网格（staggered grid）离散化</h2>
+
+<h3>11.3.1 设计原理</h3>
+
+<p>
+OGGM的通量计算采用<strong>Arakawa C网格</strong>（交错网格）——厚度和表面高程定义在网格中心，冰通量定义在网格面（相邻格点之间）：
+</p>
+
+<pre><code><span class="cmt"># 网格布局示意：</span>
+<span class="cmt">#   cell:     [ i-1 ]    [  i  ]    [ i+1 ]</span>
+<span class="cmt">#   center:    H[i-1]     H[i]       H[i+1]</span>
+<span class="cmt">#   face:  q[i-1/2]   q[i+1/2]  q[i+3/2]</span>
+
+<span class="cmt"># 交错量计算：</span>
+slope_stag[i] = (surface_h[i] - surface_h[i+<span class="dec">1</span>]) / dx
+thick_stag[i] = (thick[i] + thick[i+<span class="dec">1</span>]) / <span class="dec">2</span>
+
+<span class="cmt"># 通量在面上：</span>
+flux_stag[i] = u(thick_stag[i], slope_stag[i]) * section_stag[i]
+
+<span class="cmt"># 厚度更新在中心：</span>
+new_thick[i] = thick[i] + dt * (flux_stag[i-<span class="dec">1</span>] - flux_stag[i]) / dx</code></pre>
+
+<h3>11.3.2 为什么交错网格避免了棋盘格模式</h3>
+
+<p>
+非交错网格（所有量在网格中心）的一个已知问题是<strong>棋盘格模式</strong>——厚度场的2-dx波长振荡不会产生通量，因此不会被时间步进衰减。考虑中心梯度：
+</p>
+
+<pre><code><span class="cmt"># 非交错梯度（中心差分）：dsdx[i] = (S[i+1] - S[i-1]) / (2*dx)</span>
+<span class="cmt"># 振荡模式 S = [..., +a, -a, +a, -a, ...]</span>
+<span class="cmt">#  => dsdx = 0 （梯度为零，尽管表面有剧烈波动）</span>
+<span class="cmt">#  => 通量 = 0 （没有动力驱散这些波动）</span>
+
+<span class="cmt"># 交错梯度：dsdx[i] = (S[i] - S[i+1]) / dx</span>
+<span class="cmt"># 振荡模式 => dsdx = +/- 2a/dx （非零梯度）</span>
+<span class="cmt">#  => 通量将驱散这些波动</span></code></pre>
+
+<p>
+交错网格（staggered grid）在相邻格点间而非越过格点计算梯度，确保始终存在物理耦合，从而自然抑制数值网格尺度的振荡。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.4 带状矩阵求解器（SemiImplicitModel）</h2>
+
+<h3>11.4.1 三对角系统</h3>
+
+<p>
+半隐式离散化得到一个三对角线性系统：
+</p>
+
+<pre><code><span class="cmt"># 三对角系统：对于 i = 0, 1, ..., nx-1</span>
+d0[i] * S_new[i] + dm[i] * S_new[i-<span class="dec">1</span>] + dp[i] * S_new[i+<span class="dec">1</span>] = RHS[i]
+
+<span class="kw">其中:</span>
+  d0[i] = <span class="dec">1</span> + dt * (D_front[i] + D_back[i]) / dx^<span class="dec">2</span>
+  dm[i] = -dt * D_back[i] / dx^<span class="dec">2</span>
+  dp[i] = -dt * D_front[i] / dx^<span class="dec">2</span>
+  RHS[i] = H_old[i] + dt * MB[i] + dt * b_corr[i]
+
+<span class="cmt"># 使用scipy的带状矩阵求解器：</span>
+<span class="kw">from</span> scipy.linalg <span class="kw">import</span> solve_banded
+S_new = solve_banded((<span class="dec">1</span>, <span class="dec">1</span>), ab_matrix, RHS)</code></pre>
+
+<p>
+<code>solve_banded(l_and_u, ab, b)</code> 的<code>(1,1)</code>表示主对角线上下各有一条子对角线（三对角），<code>ab</code>矩阵以压缩格式存储非零对角线。<code>nx</code>通常为50-500，矩阵求解的计算成本O(nx)几乎可以忽略。
+</p>
+
+<h3>11.4.2 消融区边界条件</h3>
+
+<p>
+在冰川末端（消融区最后一个有冰的格点），施加<strong>零厚度边界条件</strong>：<code>H[nx-1] = 0</code>。对应地，三对角系统的最后一行被修正为简单的<code>S_new[nx-1] = bed_h[nx-1]</code>（表面等于冰床，无冰）。这确保了消融区边界处质量守恒的正确处理。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.5 自适应时间步长</h2>
+
+<h3>11.5.1 三层嵌套时间循环</h3>
+
+<p>
+OGGM动力学模拟的时间步进由三层嵌套控制：
+</p>
+
+<pre><code><span class="cmt"># 第1层：年度步（yearly step）</span>
+<span class="kw">while</span> yr &lt; y1:
+    mb_updated = <span class="dec">False</span>
+    <span class="kw">for</span> month <span class="kw">in</span> <span class="dec">range</span>(<span class="dec">12</span>):           <span class="cmt"># 第2层：月度步（monthly step）</span>
+        <span class="kw">if</span> feedback_mode == <span class="str">'monthly'</span>:
+            update_mb_model()
+        remaining = <span class="dec">1</span>/<span class="dec">12</span>               <span class="cmt"># 目标时间 = 一个月（~0.083年）</span>
+        <span class="kw">while</span> remaining &gt; <span class="dec">0</span>:            <span class="cmt"># 第3层：CFL子步（sub-step）</span>
+            dt_cfl = cfl * dx / max_u
+            dt = min(dt_cfl, remaining)
+            step(dt)
+            remaining -= dt</code></pre>
+
+<p>
+最小子步时长由 <code>cfl_min_dt</code> 限制（默认60秒）。当冰川流速极高（如 > 10000 m/yr，在巨型入海型冰川（tidewater glaciers）中可达此值）且网格很细时，这个下限防止了无限细分的退化情况。
+</p>
+
+<h3>11.5.2 计算效率的优化</h3>
+
+<p>
+在典型生产模拟中（dx ~ 100-200 m, u ~ 50-300 m/yr），CFL子步为每年10-50步。月度循环的开销可忽略（每年仅12次MB更新和循环管理）。年度步主要用于触发MB缓存更新和诊断检查，频率为每年一次。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.6 质量守恒</h2>
+
+<h3>11.6.1 MassConservationChecker包装器（第2031行）</h3>
+
+<p>
+<code>MassConservationChecker</code> 是对任何FlowlineModel的一个包装器，在每个时间步前后记录总质量并报告任何不守恒情况：
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">MassConservationChecker</span>:
+    <span class="kw">def</span> <span class="fn">step</span>(<span class="dec">self</span>, <span class="dec">dt</span>):
+        mass_before = <span class="dec">self</span>.model.volume_m3
+        <span class="dec">self</span>.model.step(dt)
+        mass_after = <span class="dec">self</span>.model.volume_m3
+        <span class="cmt"># 预期质量变化 = MB积分 + 通量边界条件</span>
+        <span class="cmt"># 实际质量变化 = mass_after - mass_before</span>
+        <span class="cmt"># 差异 = 当前步的数值质量泄漏</span></code></pre>
+
+<p>
+这对于开发和调试新动力学方案至关重要——任何非零的质量差异都表示数值方案中的实现错误。
+</p>
+
+<h3>11.6.2 通量闸门（flux gate）边界条件</h3>
+
+<p>
+在冰分（glacier divide，冰川最高点，u=0），冰通量为零——没有上游物质来源。这个物理约束在数值上通过<strong>通量闸门（flux gate）边界条件</strong>实现：<code>q[0] = 0</code>（流线起点的通量强制为零）。这防止了"凭空生成"的冰从上游进入模型域。
+</p>
+
+<h3>11.6.3 体积追踪与崩解桶（calving bucket）机制</h3>
+
+<p>
+质量守恒需要通过<code>calving_bucket</code>（崩解桶）模式处理崩解——崩解以离散的网格单元大小移除冰，但每次只有部分网格单元需要移除。桶机制（bucket mechanism）累积分数质量直到达到完整网格单元的体积，然后一次性移除——这种方法保持了体积追踪的精确性而不引入分数网格单元。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.7 高程反馈机制</h2>
+
+<p>
+<code>mb_elev_feedback</code> 是OGGM在高程-物质平衡耦合上的核心控制参数。当冰表面因动力学而改变高度时，物质平衡必须更新以反映新的表面高程：
+</p>
+
+<pre><code><span class="cmt"># 反馈周期对数值行为的影响：</span>
+<span class="str">'always'</span>:  每个子步更新MB — 物理上最精确，但严重增加计算成本
+<span class="str">'monthly'</span>: 每12个子步更新MB — 接近连续反馈
+<span class="str">'annual'</span>:  每12*N_substep步更新MB — 默认
+<span class="str">'never'</span>:   从不更新MB — 固定气候实验（物理上与"平衡态"不同）</span></pre>
+
+<p>
+高程反馈中的关键权衡：更频繁的反馈增加精确度但也增加了计算成本（尤其在MB模型基于月度气候数据时，每次更新可能触发对多变量格网数据（gridded data）的查询）。对于多数冰川，每年1-10米的高程变化意味着年度反馈的误差在约0.1-0.5 m w.e. MB偏差以内，这在气候强迫的不确定性中是可以接受的。
+</p>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">高程反馈与模型稳定性</div>
+  <p>
+    高程反馈本身是一种正反馈：表面下降 → 更多消融（气温更高） → 更多下降。在显式方案中，这种正反馈可能与CFL不稳定耦合，触发"runaway thinning"。SemiImplicitModel的隐式处理能部分缓解这一问题，但合理的<code>mb_elev_feedback</code>频率（如'annual'而非'monthly'）仍然是一个重要的稳定性约束。对于入海型冰川（tidewater glacier）的快速消融场景，可能需要更保守的CFL设置。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>11.8 支流通量合并（tributary flux merging）</h2>
+
+<h3>11.8.1 高斯加权的动机</h3>
+
+<p>
+支流贡献到主流线的冰通量通过高斯加权核分布在多个格点上。核心问题是：支流在一个精确的几何点（交汇处）汇入主流线，但冰通量不应集中在一个网格点上——那样会造成急剧的通量梯度（数值不稳定）。高斯分布将通量"涂抹"在交汇点附近的几个格点上：
+</p>
+
+<pre><code><span class="cmt"># 支流通量分布权重</span>
+w[j] ~ exp(-(x[j] - x_junction)^<span class="dec">2</span> / (<span class="dec">2</span> * sigma^<span class="dec">2</span>))
+<span class="cmt"># sigma 取决于冰川宽度：wider -> larger sigma -> more smoothing</span>
+<span class="cmt"># 核大小：5, 7, 或 9 个格点</span></code></pre>
+
+<p>
+核大小的自适应选择确保了较小的山谷冰川（支流交汇处下游宽度较窄）的支流贡献不会被过度涂抹，而较大的入海型冰川（tidewater glaciers）/冰盖的宽阔接收区能足够平滑地吸收支流输入。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.9 冰速计算</h2>
+
+<h3>11.9.1 深度平均速度与表面速度</h3>
+
+<p>
+SIA给出的速度是<strong>深度平均</strong>的，但表面速度（卫星InSAR和特征跟踪的直接观测量）是<strong>表面</strong>速度。两者之间的关系为：
+</p>
+
+<pre><code><span class="cmt"># 深度平均速度 → 表面速度</span>
+u_surface = u_bar * (<span class="dec">n</span> + <span class="dec">2</span>) / (<span class="dec">n</span> + <span class="dec">1</span>)
+
+<span class="cmt"># 对于 n=3: u_surface = u_bar * 5/4 = 1.25 * u_bar</span>
+<span class="cmt"># 物理原因：速度剖面是垂向的(n+1)/(n+2)指数分布</span>
+
+<span class="cmt"># 速度在交错面上的平均值（用于诊断输出）：</span>
+u_at_center[i] = (u_stag[i-<span class="dec">1</span>] + u_stag[i]) / <span class="dec">2</span></code></pre>
+
+<h3>11.9.2 速度诊断与观测校准</h3>
+
+<p>
+在诊断输出中，OGGM将交错速度平均到网格中心，然后乘以<code>surface_velocity_factor</code>（来自cfg.PARAMS）进行经验调整。这个因子的默认值为1.0，但在某些标定到卫星观测的项目中被调至0.5-2.0不等——反映了SIA速度理论值与观测值之间的系统性偏差。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.10 SIA扩散率推导</h2>
+
+<p>
+将SIA重新表述为扩散形式是半隐式方案的基础：
+</p>
+
+<pre><code><span class="cmt"># 通量形式：q = -gamma * H^(n+2) * |dS/dx|^(n-1) * dS/dx</span>
+<span class="cmt"># 其中 gamma = 2*A*(rho*g)^n / (n+2)</span>
+
+<span class="cmt"># 连续性方程：dH/dt = MB - dq/dx</span>
+<span class="cmt">#            = MB + d/dx[D * dS/dx]</span>
+<span class="cmt"># 其中扩散系数 D = gamma * H^(n+2) * |dS/dx|^(n-1)</span>
+
+<span class="cmt"># 对 n=3: D = gamma * H^5 * (dS/dx)^2</span>
+<span class="cmt"># 扩散率对厚度的强敏感性（H^5！）是冰川响应非线性的根源</span></code></pre>
+
+<p>
+扩散系数D中H<sup>5</sup>的强依赖意味着当冰厚加倍（2x）时扩散率增加32倍，这解释了为什么厚冰川对气候变化更敏感（响应更快），而薄冰川的变化更缓慢。
+</p>
+
+<!-- ================================================================== -->
+<h2>11.11 通量散度作为残差</h2>
+
+<p>
+<code>dh/dt - climatic_mb</code> 即<strong>通量散度残差</strong>是一个核心诊断量。在平衡态中，残差应为零——MB在所有位置的积累都被冰流动力学精确平衡。在非平衡态中，残差表示局部正在发生质量净增（整理，div为正）或净损失（消融，div为负）。这个残差对于理解冰川不同部位的质量变化来源非常重要。
+</p>
+
+<pre><code><span class="cmt"># 诊断残差（用于模型验证）：</span>
+residual = dh/dt - climatic_mb
+<span class="cmt"># 如果 residual = 0: 冰川处于平衡（冰流完美匹配气候）</span>
+<span class="cmt"># 如果 residual > 0: 动力学敛聚（局部冰流快于气候可提供的）</span>
+<span class="cmt"># 如果 residual < 0: 动力学扩散（局部冰流不足以带走所有积累）</span></code></pre>
+
+<!-- ================================================================== -->
+<h2>11.12 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>默认值</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>n</code></td><td>3</td><td>Glen流动律应力指数</td></tr>
+    <tr><td><code>glen_a</code></td><td>2.4e-24</td><td>Glen流动律参数 (Pa<sup>-n</sup> s<sup>-1</sup>)</td></tr>
+    <tr><td><code>cfl (FluxBased)</code></td><td>0.02</td><td>CFL数（对流稳定性）</td></tr>
+    <tr><td><code>cfl (SemiImplicit)</code></td><td>0.50</td><td>CFL数（扩散稳定性）</td></tr>
+    <tr><td><code>cfl_min_dt</code></td><td>60 秒</td><td>最小允许子步时长</td></tr>
+    <tr><td><code>(n+2)/(n+1)</code></td><td>1.25</td><td>表面速度/深度平均速度比率</td></tr>
+    <tr><td><code>D = gamma*H^5*(S')^2</code></td><td>-</td><td>SIA扩散系数（n=3时的形式）</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>11.13 总结</h2>
+
+<p>
+本章深入探讨了OGGM动力学代码背后的数值方法：SIA方程的两类离散化方案（显式通量形式和半隐式扩散形式）、CFL条件导出的稳定约束、交错网格的棋盘格模式抑制原理、以及支流通量的高斯合并技术。理解这些数值基础对于有效使用OGGM、扩展其模型系统、以及诊断模拟中的非预期行为都至关重要。
+</p>
+
+<p>
+半隐式方案通过将SIA线性化并求解三对角系统获得巨大的稳定性优势，但其单流线限制限制了其在多条支流冰川上的应用。显式方案更灵活但步长更小——这是冰川模拟中经典的"精度-效率"张力的具体体现。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch10.html">第10章：冰流动力学：Flowline模型</a></span>
+  <span class="next"><a href="ch12.html">第12章：崩解参数化</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

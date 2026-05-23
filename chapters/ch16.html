@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第16章 命令行界面 — OGGM 源码深度解析</title>
+<style>
+  :root {
+    --bg: #fafaf9;
+    --card: #ffffff;
+    --text: #1c1917;
+    --muted: #57534e;
+    --border: #e7e5e4;
+    --accent: #2563eb;
+    --accent-dim: #dbeafe;
+    --warn-bg: #fef3c7;
+    --warn-fg: #92400e;
+    --tip-bg: #d1fae5;
+    --tip-fg: #065f46;
+    --expert-bg: #ede9fe;
+    --expert-fg: #5b21b6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; }
+  .container { max-width: 860px; margin: 0 auto; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 3rem 3.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+  h1 { font-size: 2.2rem; border-bottom: 3px solid var(--accent); padding-bottom: .5rem; margin-bottom: .4rem; }
+  h2 { font-size: 1.55rem; margin: 2.2rem 0 .6rem; padding: .3rem 0; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.22rem; margin: 1.5rem 0 .5rem; color: var(--muted); }
+  h4 { font-size: 1.05rem; margin: 1.2rem 0 .4rem; }
+  p { margin: .7rem 0; }
+  pre { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 1rem 1.2rem; overflow-x: auto; font-size: .88rem; line-height: 1.5; margin: 1rem 0; }
+  code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88rem; }
+  :not(pre) > code { background: #f0efed; color: #b91c1c; padding: .12em .4em; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  thead { background: var(--accent-dim); }
+  th, td { border: 1px solid var(--border); padding: .5rem .7rem; text-align: left; }
+  th { font-weight: 600; }
+  .callout { border-left: 4px solid; border-radius: 6px; padding: .8rem 1rem; margin: 1.2rem 0; }
+  .callout.warning { background: var(--warn-bg); border-color: #f59e0b; color: var(--warn-fg); }
+  .callout.tip { background: var(--tip-bg); border-color: #10b981; color: var(--tip-fg); }
+  .callout.expert { background: var(--expert-bg); border-color: #8b5cf6; color: var(--expert-fg); }
+  .callout-title { font-weight: 700; display: block; margin-bottom: .25rem; }
+  .tag { display: inline-block; font-size: .78rem; font-weight: 600; padding: .15em .6em; border-radius: 99px; margin-right: .3em; }
+  .tag-beginner { background: #d1fae5; color: #065f46; }
+  .tag-intermediate { background: #fef3c7; color: #92400e; }
+  .tag-advanced { background: #ede9fe; color: #5b21b6; }
+  .chapter-nav { display: flex; justify-content: space-between; margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: .9rem; }
+  footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>第16章 命令行界面</h1>
+<p><span class="tag tag-beginner">入门</span> <span class="tag tag-intermediate">操作指南</span></p>
+<p>OGGM的命令行界面（CLI）是面向最终用户的主要交互接口。通过<code>cli/</code>目录下的一组模块，用户无需编写Python代码即可完成从数据下载到全球冰川模拟的完整工作流。本章详细解析CLI的架构设计、主要命令、配置机制和HPC部署模式。</p>
+
+<h2>16.1 CLI架构：入口点与模块组织</h2>
+
+<h3>16.1.1 pyproject.toml入口点注册</h3>
+
+<p>OGGM使用PEP 621标准的<code>pyproject.toml</code>注册CLI入口点。每个CLI命令对应一个<code>[project.scripts]</code>条目：</p>
+
+<pre>[project.scripts]
+oggm_prepro = "oggm.cli.prepro_levels:main"
+oggm_benchmark = "oggm.cli.benchmark:main"</pre>
+
+<p>当用户执行<code>oggm_prepro</code>时，Python调用<code>oggm.cli.prepro_levels.main()</code>函数。这种设计遵循了Python打包的最佳实践，保证了跨平台的兼容性。</p>
+
+<h3>16.1.2 CLI模块清单</h3>
+
+<table>
+  <thead><tr><th>模块</th><th>命令</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td><code>prepro_levels.py</code></td><td><code>oggm_prepro</code></td><td>主力常用预处理管线（L0-L5）</td></tr>
+    <tr><td><code>benchmark.py</code></td><td><code>oggm_benchmark</code></td><td>性能基准测试</td></tr>
+  </tbody>
+</table>
+
+<h2>16.2 oggm_prepro：主力常用CLI</h2>
+
+<p><code>oggm_prepro</code>是OGGM最重要（也最复杂）的命令行工具。它将第15章讨论的5级预处理管线暴露为一系列命令行参数。</p>
+
+<h3>16.2.1 基本调用结构</h3>
+
+<pre>oggm_prepro \
+  --rgi-reg 01 \                    # RGI区域编号
+  --rgi-version 6 \                 # RGI版本
+  --map-border 160 \                 # 周围边距（像素）
+  --start-level 0 \                 # 起始预处理级别（prepro level）
+  --max-level 4 \                   # 最大运行级别
+  --working-dir /path/to/wd \       # 工作目录
+  --output-dir /path/to/out         # 输出目录</pre>
+
+<h3>16.2.2 五级管线参数</h3>
+
+<p><code>--start-level</code>和<code>--max-level</code>定义了管线执行的起止范围。完整流程为L0→L1→L2→L3→L4→L5：</p>
+
+<table>
+  <thead><tr><th>级别</th><th>执行内容</th><th>关键输出文件</th></tr></thead>
+  <tbody>
+    <tr><td>L0</td><td>RGI初始化，gdir创建</td><td><code>glacier_grid.json</code></td></tr>
+    <tr><td>L1</td><td>DEM裁剪，冰川掩膜</td><td><code>gridded_data.nc</code>, <code>glacier_mask.tif</code></td></tr>
+    <tr><td>L2</td><td>完整GIS预处理链</td><td><code>centerlines.pkl</code>, <code>geometries.pkl</code></td></tr>
+    <tr><td>L3</td><td>气候数据+MB校准+反演</td><td><code>inversion_output.pkl</code>, <code>climate_historical.nc</code></td></tr>
+    <tr><td>L4</td><td>历史模拟运行</td><td><code>model_diagnostics.nc</code>, <code>model_flowlines.nc</code></td></tr>
+    <tr><td>L5</td><td>清理中间文件</td><td>仅保留最终输出</td></tr>
+  </tbody>
+</table>
+
+<h3>16.2.3 完整CLI参数表</h3>
+
+<table>
+  <thead><tr><th>参数</th><th>类型</th><th>默认值</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>--rgi-reg</code></td><td>str</td><td><code>OGGM_RGI_REG</code> env</td><td>RGI区域编号（如"01"代表Alaska）</td></tr>
+    <tr><td><code>--rgi-version</code></td><td>int</td><td>6</td><td>RGI版本（6或7）</td></tr>
+    <tr><td><code>--map-border</code></td><td>int</td><td>160</td><td>冰川周围扩展像素数（越大越"安全"但对DEM而言更贵）</td></tr>
+    <tr><td><code>--start-level</code></td><td>int</td><td>0</td><td>起始预处理级别（prepro level）</td></tr>
+    <tr><td><code>--max-level</code></td><td>int</td><td>5</td><td>最大运行级别</td></tr>
+    <tr><td><code>--start-base-url</code></td><td>str</td><td>None</td><td>恢复归档的URL（增量重启）</td></tr>
+    <tr><td><code>--working-dir</code></td><td>str</td><td><code>OGGM_WORKDIR</code> env</td><td>工作目录路径</td></tr>
+    <tr><td><code>--output-dir</code></td><td>str</td><td><code>OGGM_OUTDIR</code> env</td><td>输出目录路径（与workdir可分离）</td></tr>
+    <tr><td><code>--dem-source</code></td><td>str</td><td>配置默认</td><td>DEM源（ALL, STANDARD, 或特定代码如"COPDEM"）</td></tr>
+    <tr><td><code>--elev-bands</code></td><td>flag</td><td>False</td><td>使用elevation bands流线方法（默认为中心线方法）</td></tr>
+    <tr><td><code>--centerlines</code></td><td>flag</td><td>True</td><td>使用中心线方法（默认启用）</td></tr>
+    <tr><td><code>--mb-calibration-strategy</code></td><td>str</td><td>informed_threestep</td><td>MB校准策略：informed_threestep, melt_temp, temp_melt</td></tr>
+    <tr><td><code>--add-consensus-thickness</code></td><td>flag</td><td>False</td><td>添加Farinotti共识冰厚数据</td></tr>
+    <tr><td><code>--add-itslive-velocity</code></td><td>flag</td><td>False</td><td>添加ITS_LIVE表面速度数据</td></tr>
+    <tr><td><code>--add-millan-thickness</code></td><td>flag</td><td>False</td><td>添加Millan冰厚估计数据</td></tr>
+    <tr><td><code>--add-hugonnet-dhdt</code></td><td>flag</td><td>False</td><td>添加Hugonnet高程变化率数据</td></tr>
+    <tr><td><code>--dynamic-spinup</code></td><td>str</td><td>None</td><td>动态预热（dynamic spinup）策略（area/dmdtda, volume/dmdtda）</td></tr>
+    <tr><td><code>--override-params</code></td><td>str</td><td>None</td><td>JSON字符串覆盖默认参数</td></tr>
+  </tbody>
+</table>
+
+<h3>16.2.4 流线方法选择</h3>
+
+<p>OGGM提供两种流线提取方法，通过<code>--elev-bands</code>和<code>--centerlines</code>互斥标志选择：</p>
+
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>中心线方法</strong>（默认）：基于Kienholz算法计算几何中心线，再离散化为流线。精度更高，但计算量更大。</li>
+  <li><strong>高程带方法</strong>（--elev-bands）：按高程区间划分冰川，每带产生一条等距的流线。速度更快，适合大量冰川的概化分析。</li>
+</ul>
+
+<div class="callout tip">
+  <span class="callout-title">选择建议</span>
+  对于数量少于1000条冰川的详细研究，首选中心线方法（默认）。对于全球尺度的快速扫描或敏感性分析，高程带方法能显著加速。两种方法在L3及以后级别的计算时间差异可达5-10倍。
+</div>
+
+<h3>16.2.5 物质平衡校准策略</h3>
+
+<p><code>--mb-calibration-strategy</code>控制温度敏感度参数mu*的校准方式：</p>
+
+<table>
+  <thead><tr><th>策略</th><th>算法</th><th>适用场景</th></tr></thead>
+  <tbody>
+    <tr><td><code>informed_threestep</code></td><td>三步信息校准（默认）</td><td>标准正式运行，有大地测量MB数据</td></tr>
+    <tr><td><code>melt_temp</code></td><td>融化温度法</td><td>简化校准，备选方案</td></tr>
+    <tr><td><code>temp_melt</code></td><td>温度融化法</td><td>另一备选方案</td></tr>
+  </tbody>
+</table>
+
+<h2>16.3 环境变量与配置交互</h2>
+
+<p>OGGM CLI的参数解析遵循明确的优先级：</p>
+
+<pre>CLI显式参数 > 环境变量 > params.cfg配置文件 > 内置默认值</pre>
+
+<p>五个核心环境变量：</p>
+
+<table>
+  <thead><tr><th>变量</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>OGGM_RGI_REG</code></td><td>默认RGI区域编号</td></tr>
+    <tr><td><code>OGGM_MAP_BORDER</code></td><td>默认地图边距</td></tr>
+    <tr><td><code>OGGM_WORKDIR</code></td><td>默认工作目录</td></tr>
+    <tr><td><code>OGGM_OUTDIR</code></td><td>默认输出目录</td></tr>
+    <tr><td><code>OGGM_EXTRACT_DIR</code></td><td>临时解压目录</td></tr>
+  </tbody>
+</table>
+
+<p>复合参数通过<code>--override-params</code>传入JSON字符串覆盖<code>params.cfg</code>中的任意值：</p>
+
+<pre>oggm_prepro --override-params '{"mp_processes": 8, "use_multiple_flowlines": false}' \ ...
+</pre>
+
+<div class="callout warning">
+  <span class="callout-title">参数覆盖注意事项</span>
+  <code>--override-params</code>提供的JSON会与<code>params.cfg</code>进行<strong>浅层合并</strong>。嵌套配置项（如<code>"climate": {"temp_use_gradient": true}</code>）可能需要完整提供嵌套对象。建议在运行前用<code>oggm.cfg.log_params()</code>验证最终生效的参数。
+</div>
+
+<h2>16.4 增量处理与恢复</h2>
+
+<p><code>--start-base-url</code>是工业化生产的关键参数。它允许从远程URL加载前一个预处理级别（prepro level）的tar存档，实现断点恢复：</p>
+
+<pre># 首次运行L0-L2
+oggm_prepro --start-level 0 --max-level 2 ...
+
+# L2完成后，从L2存档恢复，继续L3-L5
+oggm_prepro --start-level 3 --max-level 5 \
+  --start-base-url https://cluster.unibe.ch/prepro/RGIv6/L2/RGI01_L2.tar.gz ...</pre>
+
+<p>这种设计将耗时的工作流分解为可独立调度、可故障恢复的阶段。在SLURM集群中，每个级别可以提交为独立的job array，充分利用作业调度系统的容错能力。</p>
+
+<h2>16.5 oggm_benchmark：性能基准测试</h2>
+
+<p><code>cli/benchmark.py</code>提供了一个标准化的性能测试工具。它定义了一条13任务的线性管线，在恒定气候和随机气候两种条件下各运行250年：</p>
+
+<pre>benchmark_tasks = [
+    tasks.define_glacier_region,
+    tasks.glacier_masks,
+    tasks.compute_centerlines,
+    tasks.initialize_flowlines,
+    tasks.compute_downstream_line,
+    tasks.compute_downstream_bedshape,
+    tasks.catchment_area,
+    tasks.catchment_intersections,
+    tasks.catchment_width_geom,
+    tasks.catchment_width_correction,
+    tasks.process_climate_data,
+    tasks.local_mustar,
+    tasks.run_random_climate,  # 或 run_constant_climate
+]</pre>
+
+<p>对每个任务，benchmark记录执行时间并输出CSV格式的计时报告。<code>constant_climate</code>模式使用不变的气候（适合测试模型物理），<code>random_climate</code>模式使用随机生成的气候序列（适合测试模型对气候变率的响应）。</p>
+
+<h2>16.6 HPC部署模式</h2>
+
+<h3>16.6.1 SLURM Job Array模式</h3>
+
+<p>RGI的19个一级区域天然适合SLURM job array：</p>
+
+<pre>#!/bin/bash
+#SBATCH --job-name=oggm_prepro
+#SBATCH --array=1-19
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+
+export OGGM_WORKDIR=/scratch/oggm_work
+export OGGM_OUTDIR=/scratch/oggm_output
+
+oggm_prepro \
+  --rgi-reg $(printf "%02d" $SLURM_ARRAY_TASK_ID) \
+  --start-level 0 \
+  --max-level 5</pre>
+
+<p>每个数组任务处理一个RGI区域，16个CPU核心用于multiprocessing。19个任务可以并行提交（取决于集群资源限制），总吞吐量受限于最慢的区域（通常是区域19，南极外围冰川）。</p>
+
+<h3>16.6.2 MPI多节点模式</h3>
+
+<p>对于单个大型RGI区域（如Alaska有超过27000条冰川），单节点16核可能不够。此时可以启用MPI跨节点并行：</p>
+
+<pre>#!/bin/bash
+#SBATCH --job-name=oggm_mpi
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=16
+
+mpirun -np 64 python -c "
+from oggm import workflow
+# ... 设置RGI区域 ...
+workflow.execute_entity_task(task, gdirs)
+"</pre>
+
+<h2>16.7 典型工作流示例</h2>
+
+<h4>单冰川快速测试</h4>
+<pre># 仅处理RGI60-11.00897（Hintereisferner）
+oggm_prepro \
+  --rgi-reg single \
+  --start-level 0 --max-level 5 \
+  --working-dir ./test_wd</pre>
+
+<h4>区域处理（Alaska）</h4>
+<pre>oggm_prepro \
+  --rgi-reg 01 --rgi-version 6 \
+  --map-border 160 \
+  --dem-source COP30 \
+  --start-level 0 --max-level 4</pre>
+
+<h4>动态预热（dynamic spinup）校准</h4>
+<pre>oggm_prepro \
+  --rgi-reg 11 --rgi-version 6 \
+  --dynamic-spinup volume/dmdtda \
+  --start-level 3 --max-level 4 \
+  --add-consensus-thickness</pre>
+
+<h4>多区域集合</h4>
+<pre>for reg in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19; do
+  oggm_prepro --rgi-reg $reg --start-level 0 --max-level 5 &
+done
+wait</pre>
+
+<div class="callout expert">
+  <span class="callout-title">业务化运行环境建议</span>
+  在业务化运行环境中运行全球19个RGI区域时，预计需要数百GB的磁盘空间和数千CPU小时。强烈建议：(1) 在集群上使用job array而非本地循环；(2) 启用等级存档，每个级别结束后立即压缩；(3) 在运行前检查磁盘配额和inode限制。
+</div>
+
+<h2>16.8 小结</h2>
+
+<p>OGGM的CLI层将强大的科学计算能力封装为直观的命令行参数。从简单的单冰川测试到全球19个区域的分布式处理，<code>oggm_prepro</code>提供了统一的界面。理解其参数体系、环境变量优先规则和增量恢复机制，是在HPC环境中高效使用OGGM的前提。</p>
+
+<div class="chapter-nav">
+  <span>上一章：第15章 工作流管线</span>
+  <span>下一章：第17章 MPI并行计算</span>
+</div>
+<footer>OGGM 源码深度解析 &copy; 2026</footer>
+
+</div>
+</body>
+</html>

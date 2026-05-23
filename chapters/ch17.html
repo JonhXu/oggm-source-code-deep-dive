@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第17章 MPI并行计算 — OGGM 源码深度解析</title>
+<style>
+  :root {
+    --bg: #fafaf9;
+    --card: #ffffff;
+    --text: #1c1917;
+    --muted: #57534e;
+    --border: #e7e5e4;
+    --accent: #2563eb;
+    --accent-dim: #dbeafe;
+    --warn-bg: #fef3c7;
+    --warn-fg: #92400e;
+    --tip-bg: #d1fae5;
+    --tip-fg: #065f46;
+    --expert-bg: #ede9fe;
+    --expert-fg: #5b21b6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; }
+  .container { max-width: 860px; margin: 0 auto; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 3rem 3.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+  h1 { font-size: 2.2rem; border-bottom: 3px solid var(--accent); padding-bottom: .5rem; margin-bottom: .4rem; }
+  h2 { font-size: 1.55rem; margin: 2.2rem 0 .6rem; padding: .3rem 0; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.22rem; margin: 1.5rem 0 .5rem; color: var(--muted); }
+  h4 { font-size: 1.05rem; margin: 1.2rem 0 .4rem; }
+  p { margin: .7rem 0; }
+  pre { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 1rem 1.2rem; overflow-x: auto; font-size: .88rem; line-height: 1.5; margin: 1rem 0; }
+  code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88rem; }
+  :not(pre) > code { background: #f0efed; color: #b91c1c; padding: .12em .4em; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  thead { background: var(--accent-dim); }
+  th, td { border: 1px solid var(--border); padding: .5rem .7rem; text-align: left; }
+  th { font-weight: 600; }
+  .callout { border-left: 4px solid; border-radius: 6px; padding: .8rem 1rem; margin: 1.2rem 0; }
+  .callout.warning { background: var(--warn-bg); border-color: #f59e0b; color: var(--warn-fg); }
+  .callout.tip { background: var(--tip-bg); border-color: #10b981; color: var(--tip-fg); }
+  .callout.expert { background: var(--expert-bg); border-color: #8b5cf6; color: var(--expert-fg); }
+  .callout-title { font-weight: 700; display: block; margin-bottom: .25rem; }
+  .tag { display: inline-block; font-size: .78rem; font-weight: 600; padding: .15em .6em; border-radius: 99px; margin-right: .3em; }
+  .tag-beginner { background: #d1fae5; color: #065f46; }
+  .tag-intermediate { background: #fef3c7; color: #92400e; }
+  .tag-advanced { background: #ede9fe; color: #5b21b6; }
+  .chapter-nav { display: flex; justify-content: space-between; margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: .9rem; }
+  footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>第17章 MPI并行计算</h1>
+<p><span class="tag tag-advanced">高级</span> <span class="tag tag-advanced">HPC</span></p>
+<p>OGGM的MPI模块（<code>mpi.py</code>，约100行）是整个并行计算体系的顶层支柱。虽然在代码体量上远小于workflow.py，但它实现了一种经典且高效的master-worker并行模式，使得OGGM能够跨越多台计算节点的边界，处理数万条冰川。</p>
+
+<h2>17.1 MPI设计哲学：极简与健壮</h2>
+
+<p>OGGM的MPI设计遵循"够用即可"的原则。它不试图实现复杂的消息传递模式或分布式数据结构，而是聚焦于一个核心任务：<strong>将冰川处理任务高效地分发到多台节点上执行</strong>。这种设计让核心逻辑保持精简，但不适合更复杂的并行模式（如分布式参数优化）。对于OGGM的主要计算负载——独立冰川的并行处理——master-worker模式已经足够。</p>
+
+<p>MPI在OGGM中的定位是替代multiprocessing提供多节点能力。在语义上，两者等价：都是将<code>execute_entity_task</code>的工作负载分发到多个worker上。区别在于multiprocessing受限于单节点的核心数，而MPI可以扩展到集群的数百核。</p>
+
+<h2>17.2 MPI初始化与导入时检测</h2>
+
+<h3>17.2.1 _init_oggm_mpi：导入时的静默检测</h3>
+
+<p>OGGM在包导入时就检测MPI的可用性（<code>oggm/__init__.py</code>第17行）：</p>
+
+<pre>try:
+    from oggm.mpi import _init_oggm_mpi
+    _init_oggm_mpi()
+except ImportError:
+    _have_ogmpi = False</pre>
+
+<p><code>_init_oggm_mpi</code>函数定义在<code>mpi.py</code>中：</p>
+
+<pre>def _init_oggm_mpi():
+    """Initialize MPI for OGGM if available.
+
+    Called at package import time. Sets global flags that
+    workflow.py uses to decide between MPI, multiprocessing,
+    and sequential execution.
+    """
+    global _have_ogmpi, MPI, comm, rank, size
+
+    try:
+        from mpi4py import MPI as _MPI
+        MPI = _MPI
+    except ImportError:
+        _have_ogmpi = False
+        return
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    if size > 1:
+        _have_ogmpi = True
+    else:
+        _have_ogmpi = False</pre>
+
+<p>这段逻辑体现了OGGM对小规模使用的友好态度：只有<strong>真正启动了多进程MPI运行</strong>时（<code>size > 1</code>），才启用MPI模式。如果用户只是单进程运行（<code>size == 1</code>），即使安装了mpi4py，也不使用MPI路径。这避免了单进程情况下的通信开销。</p>
+
+<h3>17.2.2 SLURM环境变量检测</h3>
+
+<p>在高性能计算环境中，mpi4py本身会读取SLURM提供的环境变量（如<code>SLURM_JOBID</code>、<code>SLURM_NTASKS</code>）来配置MPI通信器。OGGM不需要直接解析这些变量——它完全依赖mpi4py的抽象层。这使得OGGM在其他作业调度系统（如PBS/Torque、LSF）中也能正常工作。</p>
+
+<h2>17.3 mpi_master_spin_tasks：中央分发算法</h2>
+
+<p>这是MPI模块的核心函数，实现了master-worker工作窃取（work stealing）模式：</p>
+
+<pre>def mpi_master_spin_tasks(gdirs, task_list):
+    """Master distributes tasks, workers execute and return results.
+
+    This is the MPI counterpart of pool.map() in the multiprocessing
+    path. The master (rank 0) sends work items to workers as they
+    become available, collects results, and assembles the final
+    ordered output.
+
+    Parameters
+    ----------
+    gdirs : list of GlacierDirectory
+        All glacier directories to process.
+    task_list : list of (callable, dict) tuples
+        Normalized task-keyword pairs for each gdir.
+
+    Returns
+    -------
+    list
+        Results in the same order as gdirs.
+    """
+    if rank == 0:
+        # Master: distribute and collect
+        results = [None] * len(gdirs)
+        next_task = 0
+        pending = {}
+        active_workers = size - 1  # rank 1..N-1 are workers
+
+        # Send initial batch to kickstart workers
+        for i in range(1, min(size, len(gdirs) + 1)):
+            if next_task < len(gdirs):
+                comm.send((next_task, gdirs[next_task],
+                           task_list[next_task]),
+                          dest=i, tag=MPI_TAG_WORK)
+                pending[i] = next_task
+                next_task += 1
+
+        # Spin loop: receive results, send new work
+        while next_task < len(gdirs) or pending:
+            status = MPI.Status()
+            result = comm.recv(
+                source=MPI.ANY_SOURCE,
+                tag=MPI.ANY_TAG,
+                status=status
+            )
+            worker = status.Get_source()
+            task_idx = pending.pop(worker)
+            results[task_idx] = result
+
+            if next_task < len(gdirs):
+                comm.send((next_task, gdirs[next_task],
+                           task_list[next_task]),
+                          dest=worker, tag=MPI_TAG_WORK)
+                pending[worker] = next_task
+                next_task += 1
+
+        return results
+    else:
+        # Worker: receive-execute-return loop
+        while True:
+            task_idx, gdir, (task, kwargs) = comm.recv(
+                source=0, tag=MPI_TAG_WORK)
+            result = task(gdir, **kwargs)
+            comm.send(result, dest=0, tag=MPI_TAG_RESULT)</pre>
+
+<h3>17.3.1 工作窃取的意义</h3>
+
+<p>在异构集群中（不同节点有不同CPU型号或者有不同程度的背景负载），各个worker的处理速度可能差异很大。"工作窃取"意味着master不会在开始时静态分配等量的工作给每个worker，而是在worker完成当前任务后立即发送下一个。这种动态负载均衡策略确保了所有worker始终保持忙碌，总体运行时间由最慢任务的平均值而非最慢worker决定。</p>
+
+<h3>17.3.2 通信标记</h3>
+
+<p>OGGM使用简单的整数标记区分消息类型：</p>
+
+<pre>MPI_TAG_WORK = 1    # master发送给worker的工作项目
+MPI_TAG_RESULT = 2  # worker返回给master的计算结果</pre>
+
+<p>这最小化了MPI通信器的复杂性。</p>
+
+<h2>17.4 MPI与Multiprocessing的选择逻辑</h2>
+
+<p>在<code>execute_entity_task</code>中的三项选择（参考第15章）体现了OGGM的并行分层策略：</p>
+
+<ol style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>MPI优先</strong>：如果<code>_have_ogmpi</code>为True，使用MPI。这是唯一的多节点方案。</li>
+  <li><strong>Multiprocessing备选</strong>：如果gdir数量大于1且MPI不可用，使用单节点进程池。</li>
+  <li><strong>顺序回退</strong>：单冰川或以上两者都不可用的最终保障。</li>
+</ol>
+
+<p>这个优先级排序反映了OGGM的设计理念：<strong>在可用性允许的情况下使用最高级别的并行方案</strong>。用户不需要手动指定并行后端——系统自动检测并选择最佳路径。</p>
+
+<h2>17.5 进程分布与角色</h2>
+
+<table>
+  <thead><tr><th>角色</th><th>Rank范围</th><th>职责</th><th>代码路径</th></tr></thead>
+  <tbody>
+    <tr><td>Master</td><td>0</td><td>任务分发、结果收集、进度监控、日志聚合</td><td><code>mpi_master_spin_tasks</code>的<code>if rank == 0</code>分支</td></tr>
+    <tr><td>Worker</td><td>1至N-1</td><td>接收任务、执行单冰川处理、返回结果</td><td><code>mpi_master_spin_tasks</code>的<code>else</code>分支</td></tr>
+  </tbody>
+</table>
+
+<p>Master本身不执行冰川处理任务——它纯粹是协调者。这个设计选择是刻意的：在master-worker模式中，让master也参与计算会引入额外的复杂性（如master必须在处理任务的同时处理来自worker的结果），而master-worker模式通常受限于master的处理能力。将master专用于协调使通信逻辑最简化。</p>
+
+<p>对于少量冰川（例如少于worker数量），可以将master配置为不参与分发（通过调整初始批次大小），但这在当前的OGGM实现中未采用，因为常见的使用场景是gdirs数量远大于worker数量。</p>
+
+<h2>17.6 配置与参数</h2>
+
+<p>MPI行为通过<code>params.cfg</code>中的<code>use_mpi</code>参数控制。当设为<code>False</code>时，即使在多进程mpirun环境中也回退到multiprocessing或顺序模式。这在调试时非常有用——可以先用顺序模式验证工作流正确性，然后启用MPI进行大规模计算。</p>
+
+<pre># params.cfg 相关内容
+use_mpi: bool = True       # 是否使用MPI（如果可用）
+mp_processes: int = -1     # multiprocessing进程数（-1 = CPU核心数）</pre>
+
+<p><code>mp_processes</code>在MPI模式下通常设为1（每个MPI进程内部不再嵌套多进程），以避免进程/线程嵌套导致的资源竞争和调度复杂性。但在某些配置中（如每个MPI进程对应一个NUMA节点），可以设小值以处理I/O密集型任务。</p>
+
+<h2>17.7 调试MPI运行</h2>
+
+<h3>17.7.1 日志聚合</h3>
+
+<p>MPI运行中，每个进程独立写日志导致的输出混乱是常见的调试痛点。OGGM通过rank-aware日志抑制来解决：</p>
+
+<pre># 只允许rank 0输出INFO及以上的日志
+# 其他rank仅输出WARNING及以上的日志
+import logging
+if rank != 0:
+    logging.getLogger('oggm').setLevel(logging.WARNING)</pre>
+
+<p>这确保了关键信息集中在master的输出中，而每个worker只在遇到问题时才会发出警告。</p>
+
+<h3>17.7.2 错误传播</h3>
+
+<p>worker中抛出的异常必须传播回master。OGGM的worker在捕获异常后将其序列化为错误令牌并通过MPI发送给master，master在收到错误令牌后中止所有待处理任务并报告问题。</p>
+
+<div class="callout warning">
+  <span class="callout-title">调试陷阱</span>
+  MPI程序的错误消息通常比顺序程序更难定位。如果所有worker在master的输出中只看到"MPI process terminated"而无具体traceback，可以使用<code>mpirun --output-filename logfile</code>将每个rank的输出重定向到独立文件，然后逐一检查。
+</div>
+
+<h2>17.8 性能考量</h2>
+
+<h3>17.8.1 通信开销</h3>
+
+<p>在MPI并行计算中，通信开销是决定可扩展性的关键因素。OGGM的冰川处理任务具有极高的计算-通信比：每个任务涉及数秒至数分钟的浮点运算，而通信仅涉及序列化一个结果对象（通常小于1MB）。这种"粗粒度"并行模式非常适合master-worker架构。</p>
+
+<p>但在以下情况下通信可能成为瓶颈：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>小冰川过多</strong>：每条冰川处理时间极短（如少于1秒），通信延迟可能与计算时间相当。</li>
+  <li><strong>结果对象过大</strong>：某些诊断输出（如完整的时间序列或高分辨率地图）可达数十MB。这种情况下应考虑将结果写回文件而非通过MPI传回。</li>
+</ul>
+
+<h3>17.8.2 负载不均衡</h3>
+
+<p>冰川处理的执行时间随冰川大小和复杂度变化显著——大型冰川的处理时间是小冰川的100-1000倍。虽然在gdir列表末尾集中出现大型冰川会导致"长尾"延迟，但OGGM的工作窃取机制会部分缓解这一问题：处理完小冰川的worker会立即接管下一个大任务。</p>
+
+<p>最佳实践是按面积降序排列gdirs——先分配大冰川，最后让小冰川填充空闲时间。这可以最小化所有worker的总等待时间。</p>
+
+<h3>17.8.3 伸缩性分析</h3>
+
+<p>在理想情况下（所有gdir处理时间相等），OGGM的MPI伸缩性接近线性——N个worker将运行时间缩短到约1/N。实际上，由于通信开销和负载不均衡，伸缩性在近百个worker时开始退化。但给定的典型RGI区域（数千条冰川），20-50个worker是效率最佳的区间。</p>
+
+<h2>17.9 HPC部署模式</h2>
+
+<h3>17.9.1 SLURM作业脚本模板</h3>
+
+<pre>#!/bin/bash
+#SBATCH --job-name=oggm_mpi
+#SBATCH --output=oggm_%j.out
+#SBATCH --error=oggm_%j.err
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=32
+#SBATCH --time=24:00:00
+#SBATCH --partition=normal
+
+module load python/3.10
+module load mpi4py
+
+# 确保每个MPI进程使用1个OpenMP线程
+export OMP_NUM_THREADS=1
+
+mpirun -np $SLURM_NTASKS python -c "
+from oggm import workflow, tasks, cfg
+cfg.initialize()
+cfg.PARAMS['mp_processes'] = 1  # 不在MPI内部嵌套多进程
+
+# 执行工作流
+gdirs = workflow.init_glacier_directories(rgi_df)
+workflow.gis_prepro_tasks(gdirs)
+workflow.climate_tasks(gdirs)
+workflow.inversion_tasks(gdirs)
+"</pre>
+
+<h3>17.9.2 区域级并行</h3>
+
+<p>对于全球19个RGI区域的处理，有两种并行模式：</p>
+
+<table>
+  <thead><tr><th>策略</th><th>并行粒度</th><th>优点</th><th>缺点</th></tr></thead>
+  <tbody>
+    <tr><td>MPI跨区域</td><td>单个gdir</td><td>完美负载均衡</td><td>需要将所有数据放在共享文件系统中</td></tr>
+    <tr><td>Job Array分区域</td><td>整个区域</td><td>无需共享文件系统，容错性更好</td><td>负载不均衡（区域大小差异大）</td></tr>
+    <tr><td>混合方案</td><td>区域内MPI + 区域间Job Array</td><td>最佳性能</td><td>调度复杂度最高</td></tr>
+  </tbody>
+</table>
+
+<p>混合方案（区域间用job array + 区域内用MPI）常用于大规模预处理。对于大型区域（01 Alaska、02 Western Canada），可部署4-8个节点的MPI；对于小型区域（如区域12 Caucasus），单个节点通常即可。</p>
+
+<h2>17.10 小结</h2>
+
+<p>OGGM的MPI模块代码量不大（约100行），但覆盖了区域冰川批处理最需要的并行模式：冰川级任务相互独立，适合master-worker式分发；当MPI不可用时，又可以回退到multiprocessing或顺序执行。这一设计使同一套工作流能在笔记本电脑和计算集群之间迁移。</p>
+
+<div class="chapter-nav">
+  <span>上一章：第16章 命令行界面</span>
+  <span>下一章：第18章 图形与可视化</span>
+</div>
+<footer>OGGM 源码深度解析 &copy; 2026</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>附录A API参考 — OGGM 源码深度解析</title>
+<style>
+:root {
+  --bg: #fffdf8; --fg: #1a1a1a; --accent: #2c5f8a; --accent-light: #e8f0f7;
+  --warn-bg: #fff3cd; --warn-border: #e6b422; --tip-bg: #d4edda; --tip-border: #28a745;
+  --expert-bg: #e2d8f0; --expert-border: #6f42c1; --code-bg: #f4f4f4; --border: #ddd;
+}
+body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg); line-height: 1.7; }
+h1 { font-size: 2rem; color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: .4rem; margin-top: 2.5rem; }
+h2 { font-size: 1.55rem; color: #1e4a6b; border-bottom: 2px solid #c8d8e8; padding-bottom: .25rem; margin-top: 2.2rem; }
+h3 { font-size: 1.25rem; color: #2c5f8a; margin-top: 1.6rem; }
+h4 { font-size: 1.1rem; color: #444; margin-top: 1.2rem; }
+p { margin: .8rem 0; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: .9rem; line-height: 1.5; }
+code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88em; background: #eee; padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+thead { background: var(--accent); color: #fff; }
+th, td { padding: .5rem .75rem; border: 1px solid var(--border); text-align: left; }
+tbody tr:nth-child(even) { background: #f9f9f9; }
+.callout { padding: .75rem 1rem; border-radius: 6px; margin: 1rem 0; border-left: 5px solid; }
+.callout.tip { background: var(--tip-bg); border-color: var(--tip-border); }
+.callout-title { font-weight: 700; margin-bottom: .25rem; display: block; }
+.chapter-nav { display: flex; justify-content: space-between; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.chapter-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+footer { text-align: center; color: #888; font-size: .85rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+ul, ol { margin: .5rem 0 .5rem 1.5rem; }
+.api-entry { margin: 1rem 0; padding: .75rem; border-left: 3px solid var(--accent); background: var(--accent-light); }
+.api-entry h4 { margin-top: 0; }
+.sig { font-family: monospace; background: #eef; padding: .2rem .5rem; border-radius: 3px; }
+.class-hierarchy { font-family: monospace; background: #f8f8f8; padding: 1rem; border: 1px solid var(--border); border-radius: 4px; white-space: pre; line-height: 1.3; }
+</style>
+</head>
+<body>
+
+<h1>附录A API参考</h1>
+
+<p>
+本附录提供了OGGM公共API的全面参考，按模块组织。每个条目包含函数/类的签名、关键参数、返回值和用途简述。本附录是参考资料而非教程——详细解释请参见相关章节。
+</p>
+
+<h2>A.1 oggm.cfg -- 配置与初始化</h2>
+
+<h3>模块级函数</h3>
+
+<div class="api-entry">
+<h4>initialize()</h4>
+<p class="sig">oggm.cfg.initialize(file=None, logging_level='INFO')</p>
+<p><strong>参数：</strong> <code>file</code> (str, 可选) -- 用于覆盖默认参数的 params.cfg 文件路径。
+<code>logging_level</code> (str) -- Python 日志级别。</p>
+<p><strong>返回值：</strong> None</p>
+<p>从内置的 <code>params.cfg</code> 加载OGGM配置，应用用户提供的覆盖参数，
+设置工作目录并配置日志系统。必须在大多数其他OGGM函数之前调用。</p>
+</div>
+
+<div class="api-entry">
+<h4>initialize_minimal()</h4>
+<p class="sig">oggm.cfg.initialize_minimal(file=None)</p>
+<p><strong>参数：</strong> <code>file</code> (str, 可选) -- params.cfg 覆盖文件。</p>
+<p><strong>返回值：</strong> None</p>
+<p>轻量级初始化，仅加载参数但不设置日志或工作目录。
+适用于只需要读取参数的脚本。</p>
+</div>
+
+<div class="api-entry">
+<h4>set_logging_config(logging_level='INFO')</h4>
+<p class="sig">oggm.cfg.set_logging_config(logging_level='INFO')</p>
+<p><strong>参数：</strong> <code>logging_level</code> (str) -- 可选值：'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'。</p>
+<p>使用指定级别配置OGGM日志记录器。由 <code>initialize()</code> 自动调用。</p>
+</div>
+
+<div class="api-entry">
+<h4>pack_config()</h4>
+<p class="sig">oggm.cfg.pack_config()</p>
+<p><strong>返回值：</strong> str -- 包含所有非默认参数和工作目录路径的JSON字符串。</p>
+<p>将当前配置序列化以便复现。可以将输出保存到模型结果旁边，
+以记录所使用的确切参数集。</p>
+</div>
+
+<div class="api-entry">
+<h4>unpack_config(json_str)</h4>
+<p class="sig">oggm.cfg.unpack_config(json_str)</p>
+<p><strong>参数：</strong> <code>json_str</code> (str) -- 之前由 <code>pack_config()</code> 生成的JSON字符串。</p>
+<p>从打包字符串恢复配置。用于重现之前运行的设置。</p>
+</div>
+
+<h3>关键属性</h3>
+
+<table>
+<thead><tr><th>属性</th><th>类型</th><th>描述</th></tr></thead>
+<tbody>
+<tr><td><code>cfg.PARAMS</code></td><td>DocumentedDict</td><td>所有配置参数的有序字典，附带文档字符串</td></tr>
+<tr><td><code>cfg.PATHS</code></td><td>dict</td><td>工作目录、缓存目录和示例数据目录的路径</td></tr>
+<tr><td><code>cfg.BASENAMES</code></td><td>DocumentedDict</td><td>从逻辑名称到 (文件名, 描述) 的映射，用于冰川目录（GlacierDirectory）文件</td></tr>
+<tr><td><code>cfg.DATA</code></td><td>dict</td><td>运行时数据，如RGI元数据、DEM数据源和气候参考</td></tr>
+</tbody>
+</table>
+
+<h2>A.2 oggm.utils -- 工具函数与GlacierDirectory</h2>
+
+<div class="api-entry">
+<h4>GlacierDirectory(rgi_entity, base_dir=None, reset=False)</h4>
+<p class="sig">class oggm.utils.GlacierDirectory(rgi_entity, base_dir=None, reset=False)</p>
+<p><strong>参数：</strong> <code>rgi_entity</code> (str, tuple或dict) -- RGI ID 字符串、RGI shapefile路径或
+RGI元数据字典。 <code>base_dir</code> (str, 可选) -- 覆盖默认工作目录。
+<code>reset</code> (bool) -- 如为True，清空现有目录内容。</p>
+<p>单个冰川的核心数据容器。管理文件路径，提供读写方法，
+并暴露冰川元数据。完整文档参见<a href="ch07.html">第7章</a>。</p>
+</div>
+
+<div class="api-entry">
+<h4>entity_task(logger, writes=[])</h4>
+<p class="sig">@oggm.utils.entity_task(logger, writes=[])</p>
+<p><strong>参数：</strong> <code>logger</code> (str 或 logging.Logger) -- 日志记录器名称或实例。
+<code>writes</code> (str列表) -- 该任务写入的 BASENAMES 键。</p>
+<p>装饰器，用于包装单冰川处理函数。提供自动日志记录、错误处理
+（通过 <code>cfg.PARAMS['continue_on_error']</code>）、计时和依赖追踪。被装饰的函数
+必须以 GlacierDirectory 作为其第一个位置参数。</p>
+</div>
+
+<div class="api-entry">
+<h4>global_task(logger)</h4>
+<p class="sig">@oggm.utils.global_task(logger)</p>
+<p>装饰器，用于全局任务（global task；而非单冰川任务），例如下载参考数据
+或汇总结果。与 <code>entity_task</code> 类似，但不期望 GlacierDirectory 参数。</p>
+</div>
+
+<div class="api-entry">
+<h4>get_demo_file(fname)</h4>
+<p class="sig">oggm.utils.get_demo_file(fname)</p>
+<p><strong>参数：</strong> <code>fname</code> (str) -- 文件名（如 'Hintereisferner_RGI5.shp'）。</p>
+<p><strong>返回值：</strong> str -- 已下载/缓存示例文件的绝对路径。</p>
+<p>从 oggm-sample-data 仓库下载（如需要）并返回文件路径。
+教程和测试中不可或缺。</p>
+</div>
+
+<div class="api-entry">
+<h4>monthly_timeseries(ini_date, end_date, cal=None)</h4>
+<p class="sig">oggm.utils.monthly_timeseries(ini_date, end_date, cal=None)</p>
+<p><strong>参数：</strong> <code>ini_date</code> (datetime-like) -- 序列的起始时间。
+<code>end_date</code> (datetime-like) -- 序列的结束时间（含）。
+<code>cal</code> (str, 可选) -- 日历类型（'standard', '365_day' 等）。</p>
+<p><strong>返回值：</strong> 按月频率的 pandas.DatetimeIndex。</p>
+<p>创建月度时间索引，在OGGM中广泛用于气候和物质平衡时间序列。</p>
+</div>
+
+<h2>A.3 oggm.core.gis -- GIS处理</h2>
+
+<div class="api-entry">
+<h4>define_glacier_region(gdir, div_id=None)</h4>
+<p class="sig">oggm.core.gis.define_glacier_region(gdir, div_id=None)</p>
+<p><strong>参数：</strong> <code>gdir</code> (GlacierDirectory)。 <code>div_id</code> (int, 可选) -- 用于具有多个流域分界的冰川的排水分界ID。</p>
+<p>使用冰川轮廓定义冰川的局部地图投影和空间域。
+初始化 Salem 网格并写入 <code>glacier_grid.json</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>process_dem(gdir)</h4>
+<p class="sig">oggm.core.gis.process_dem(gdir)</p>
+<p>下载并处理覆盖冰川的DEM瓦片。重投影到局部网格，
+填充小型空洞，并写入 <code>dem.tif</code>。DEM数据源通过
+<code>cfg.PARAMS['dem_source']</code> 配置。</p>
+</div>
+
+<div class="api-entry">
+<h4>glacier_masks(gdir)</h4>
+<p class="sig">oggm.core.gis.glacier_masks(gdir)</p>
+<p>从RGI轮廓多边形计算冰川网格掩膜。将 <code>glacier_mask</code> 和
+<code>glacier_topo</code>（限制在冰川区域内的DEM）写入 <code>gridded_data.nc</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>gridded_attributes(gdir)</h4>
+<p class="sig">oggm.core.gis.gridded_attributes(gdir)</p>
+<p>计算冰川掩膜范围内每个网格单元的坡度、坡向和到轮廓的距离。
+将多个变量写入 <code>gridded_data.nc</code>。</p>
+</div>
+
+<h2>A.4 oggm.core.centerlines -- 中心线与流线处理</h2>
+
+<div class="api-entry">
+<h4>compute_centerlines(gdir, div_id=None)</h4>
+<p class="sig">oggm.core.centerlines.compute_centerlines(gdir, div_id=None)</p>
+<p>使用最小成本路径算法从冰川掩膜计算几何中心线。
+处理多分支冰川。写入 <code>centerlines.pkl</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>initialize_flowlines(gdir)</h4>
+<p class="sig">oggm.core.centerlines.initialize_flowlines(gdir)</p>
+<p>将几何中心线转换为模型流线，包含计算宽度、面积-高度
+分布和适用于数值模拟的网格划分。写入 <code>model_flowlines.pkl</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>catchment_area(gdir)</h4>
+<p class="sig">oggm.core.centerlines.catchment_area(gdir)</p>
+<p>为每条中心线分支划分集水区。将 <code>catchment_mask</code> 写入
+<code>gridded_data.nc</code> 和 <code>geometries.pkl</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>compute_downstream_line(gdir)</h4>
+<p class="sig">oggm.core.centerlines.compute_downstream_line(gdir)</p>
+<p>计算冰川末端之外的下游中心线延伸段。用于可能超出
+当前轮廓线前进的冰川。</p>
+</div>
+
+<div class="api-entry">
+<h4>compute_downstream_bedshape(gdir)</h4>
+<p class="sig">oggm.core.centerlines.compute_downstream_bedshape(gdir)</p>
+<p>确定下游冰床形状和流线交汇处的配置。</p>
+</div>
+
+<h2>A.5 oggm.core.climate -- 气候数据处理</h2>
+
+<div class="api-entry">
+<h4>process_climate_data(gdir, **kwargs)</h4>
+<p class="sig">oggm.core.climate.process_climate_data(gdir, **kwargs)</p>
+<p>根据 <code>cfg.PARAMS['baseline_climate']</code> 分派到相应的数据商店模块。
+处理冰川的气候数据并写入 <code>climate_historical.nc</code>。
+同时校准物质平衡模型（写入 <code>mb_calib.json</code>）。</p>
+</div>
+
+<div class="api-entry">
+<h4>historical_delta_method(gdir, **kwargs)</h4>
+<p class="sig">oggm.core.climate.historical_delta_method(gdir, **kwargs)</p>
+<p>计算冰川位置处的温度和降水气候增量（GCM减去历史值）。
+用于未来预估。写入带 <code>_delta</code> 后缀的气候文件。</p>
+</div>
+
+<div class="api-entry">
+<h4>mb_calibration(gdir, **kwargs)</h4>
+<p class="sig">oggm.core.climate.mb_calibration(gdir, **kwargs)</p>
+<p>校准物质平衡模型参数（melt_f, temp_bias, prcp_fac），使其匹配
+观测的大地测量物质平衡（geodetic mass balance）或用户指定的目标值。</p>
+</div>
+
+<div class="api-entry">
+<h4>process_gcm_data(gdir, **kwargs)</h4>
+<p class="sig">oggm.core.climate.process_gcm_data(gdir, **kwargs)</p>
+<p>处理冰川位置处的原始GCM输出，计算未来情景的月温度和
+降水时间序列。</p>
+</div>
+
+<h2>A.6 oggm.core.massbalance -- 物质平衡模型</h2>
+
+<div class="api-entry">
+<h4>MassBalanceModel</h4>
+<p class="sig">class oggm.core.massbalance.MassBalanceModel</p>
+<p>所有物质平衡模型的抽象基类。子类必须实现
+<code>get_monthly_mb(heights, year, ...)</code> 和 <code>get_annual_mb(heights, year, ...)</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>MonthlyTIModel(gdir, **kwargs)</h4>
+<p class="sig">class oggm.core.massbalance.MonthlyTIModel(gdir, **kwargs)</p>
+<p>标准的月度温度指数物质平衡模型。将积累量计算为固态降水比例，
+将消融量通过度日法计算。</p>
+</div>
+
+<div class="api-entry">
+<h4>ConstantMassBalance(gdir, **kwargs)</h4>
+<p class="sig">class oggm.core.massbalance.ConstantMassBalance(gdir, **kwargs)</p>
+<p>用于未来预估的物质平衡模型。使用由历史数据叠加GCM异常
+所导出的恒定（或增量调整的）气候信号。</p>
+</div>
+
+<div class="api-entry">
+<h4>PastMassBalance(gdir, **kwargs)</h4>
+<p class="sig">class oggm.core.massbalance.PastMassBalance(gdir, **kwargs)</p>
+<p>用于历史时期的物质平衡模型。使用来自
+<code>climate_historical.nc</code> 的时变气候数据和校准后的温度指数模型（temperature-index model）。</p>
+</div>
+
+<div class="api-entry">
+<h4>MultipleFlowlineMassBalance(gdir, **kwargs)</h4>
+<p class="sig">class oggm.core.massbalance.MultipleFlowlineMassBalance(gdir, **kwargs)</p>
+<p>管理多条流线（支流）物质平衡的包装器。将物质平衡计算
+分派给每条流线并处理支流几何。</p>
+</div>
+
+<div class="api-entry">
+<h4>RandomMassBalance(gdir, **kwargs)</h4>
+<p class="sig">class oggm.core.massbalance.RandomMassBalance(gdir, **kwargs)</p>
+<p>在校准均值周围带有随机变异性的物质平衡模型。用于
+不确定性量化和集合模拟。</p>
+</div>
+
+<h2>A.7 oggm.core.inversion -- 冰厚反演</h2>
+
+<div class="api-entry">
+<h4>mass_conservation_inversion(gdir, **kwargs)</h4>
+<p class="sig">oggm.core.inversion.mass_conservation_inversion(gdir, **kwargs)</p>
+<p>通过求解质量守恒方程计算沿流线的冰厚度：
+通量散度等于表观物质平衡（apparent mass balance）。写入 <code>inversion_input.pkl</code> 和
+<code>inversion_output.pkl</code>。关键参数由 <code>cfg.PARAMS['glen_a']</code>、
+<code>cfg.PARAMS['fs']</code> 和 <code>cfg.PARAMS['inversion_glen_a']</code> 控制。</p>
+</div>
+
+<div class="api-entry">
+<h4>filter_inversion_output(gdir)</h4>
+<p class="sig">oggm.core.inversion.filter_inversion_output(gdir)</p>
+<p>对原始反演输出应用后处理滤波：去除负厚度值，
+使用高斯核平滑（宽度由 <code>cfg.PARAMS['inversion_smoothing_radius']</code>
+控制），并确保末端附近的厚度单调递减。</p>
+</div>
+
+<div class="api-entry">
+<h4>prepare_for_inversion(gdir, **kwargs)</h4>
+<p class="sig">oggm.core.inversion.prepare_for_inversion(gdir, **kwargs)</p>
+<p>准备质量守恒反演的输入数据：计算表观物质平衡（apparent mass balance），
+建立通量计算的线性方程组，并写入 <code>inversion_input.pkl</code>。</p>
+</div>
+
+<h2>A.8 oggm.core.flowline -- 冰川动力学</h2>
+
+<div class="api-entry">
+<h4>FluxBasedModel(flowlines, mb_model, y0, glen_a, fs, ...)</h4>
+<p class="sig">class oggm.core.flowline.FluxBasedModel(flowlines, mb_model=None, y0=0, glen_a=None, fs=None, ...)</p>
+<p>主要的冰川演化模型。使用半隐式有限差分格式和
+自适应时间步长求解浅冰近似方程以实现冰川厚度演化。
+支持多流线、动态预热（dynamic spinup）和入海型冰川崩解。</p>
+</div>
+
+<div class="api-entry">
+<h4>SemiImplicitModel(flowlines, mb_model, y0, glen_a, fs, ...)</h4>
+<p class="sig">class oggm.core.flowline.SemiImplicitModel(flowlines, mb_model=None, y0=0, glen_a=None, fs=None, ...)</p>
+<p>简化的半隐式求解器，用于教学和调试目的。不如
+FluxBasedModel 优化，但算法更透明。</p>
+</div>
+
+<div class="api-entry">
+<h4>flowline_model_run(gdir, model, ys, ye, ...)</h4>
+<p class="sig">oggm.core.flowline.flowline_model_run(gdir, model, ys, ye, store_diagnostics=True, ...)</p>
+<p>便捷函数，从年份 <code>ys</code> 运行流线模型到 <code>ye</code>，并可选择
+将诊断变量存储为NetCDF格式。处理完整生命周期：初始化、启动
+（如已配置）、主运行和清理。</p>
+</div>
+
+<div class="api-entry">
+<h4>FileModel(fpath)</h4>
+<p class="sig">class oggm.core.flowline.FileModel(fpath)</p>
+<p>从预先计算的NetCDF文件读取模型状态，而非运行求解器。适用于
+对先前保存的运行进行后处理和分析。</p>
+</div>
+
+<h2>A.9 oggm.workflow -- 工作流编排</h2>
+
+<div class="api-entry">
+<h4>init_glacier_directories(rgi_ids, ...)</h4>
+<p class="sig">oggm.workflow.init_glacier_directories(rgi_ids=None, from_prepro_level=None, prepro_border=10, ...)</p>
+<p><strong>参数：</strong> <code>rgi_ids</code> (list 或 str, 可选) -- 要初始化的RGI ID。如为None，查找所有现有的。
+<code>from_prepro_level</code> (int, 可选) -- 所需预处理级别（prepro level）的位掩码（0=原始, 1=GIS完成, 2=中心线完成, 3=气候完成, 4=反演完成）。
+<code>prepro_border</code> (int) -- 地图边界像素数。</p>
+<p><strong>返回值：</strong> GlacierDirectory列表</p>
+<p>为一组RGI ID创建或加载冰川目录（GlacierDirectory）。这是任何OGGM工作流的标准入口点。</p>
+</div>
+
+<div class="api-entry">
+<h4>execute_entity_task(task, gdirs, **kwargs)</h4>
+<p class="sig">oggm.workflow.execute_entity_task(task, gdirs, **kwargs)</p>
+<p><strong>参数：</strong> <code>task</code> (可调用对象) -- 以 entity_task 装饰的函数。
+<code>gdirs</code> (GlacierDirectory列表)。 <code>**kwargs</code> -- 转发给任务函数的参数。</p>
+<p>在冰川列表上执行单冰川任务。如果
+<code>cfg.PARAMS['use_multiprocessing']</code> 为True，则在多个CPU核心上分配执行。
+处理错误收集和日志记录。</p>
+</div>
+
+<div class="api-entry">
+<h4>gis_prepro_tasks(gdir, **kwargs)</h4>
+<p class="sig">oggm.workflow.gis_prepro_tasks(gdir, **kwargs)</p>
+<p>便捷函数，按顺序运行所有GIS预处理任务：
+<code>define_glacier_region</code>, <code>process_dem</code>, <code>glacier_masks</code>, <code>gridded_attributes</code>,
+<code>compute_centerlines</code>, <code>initialize_flowlines</code>, <code>catchment_area</code>,
+<code>compute_downstream_line</code>, <code>compute_downstream_bedshape</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>climate_tasks(gdir, **kwargs)</h4>
+<p class="sig">oggm.workflow.climate_tasks(gdir, **kwargs)</p>
+<p>便捷函数，用于气候相关任务：<code>process_climate_data</code> 和
+<code>historical_delta_method</code>。</p>
+</div>
+
+<div class="api-entry">
+<h4>inversion_tasks(gdir, **kwargs)</h4>
+<p class="sig">oggm.workflow.inversion_tasks(gdir, **kwargs)</p>
+<p>便捷函数，用于反演相关任务：<code>prepare_for_inversion</code>、
+<code>mass_conservation_inversion</code> 和 <code>filter_inversion_output</code>。</p>
+</div>
+
+<h2>A.10 类层次结构</h2>
+
+<div class="class-hierarchy">
+MassBalanceModel (ABC)
+├── MonthlyTIModel
+├── ConstantMassBalance
+├── PastMassBalance
+└── RandomMassBalance
+
+Flowline
+└── MixedBedFlowline
+
+FlowlineModel
+├── FluxBasedModel
+├── SemiImplicitModel
+└── FileModel
+
+GlacierDirectory
+└── (管理单冰川文件I/O)
+
+MassBalanceModel ──包装──> MultipleFlowlineMassBalance
+MultipleFlowlineMassBalance ──使用──> GlacierDirectory
+FluxBasedModel ──使用──> MultipleFlowlineMassBalance
+FluxBasedModel ──包含──> MixedBedFlowline[]
+</div>
+
+<div class="chapter-nav">
+  <a href="tutorials.html">← 第22章 OGGM教程全集</a>
+  <a href="appendix_b.html">附录B 参数参考手册 →</a>
+</div>
+
+<footer>
+  OGGM 源码深度解析 &mdash; 附录A API参考
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第19章 Sandbox与实验模块 — OGGM 源码深度解析</title>
+<style>
+:root {
+  --bg: #fffdf8;
+  --fg: #1a1a1a;
+  --accent: #2c5f8a;
+  --accent-light: #e8f0f7;
+  --warn-bg: #fff3cd;
+  --warn-border: #e6b422;
+  --tip-bg: #d4edda;
+  --tip-border: #28a745;
+  --expert-bg: #e2d8f0;
+  --expert-border: #6f42c1;
+  --code-bg: #f4f4f4;
+  --border: #ddd;
+  --tag-beginner: #28a745;
+  --tag-intermediate: #fd7e14;
+  --tag-advanced: #dc3545;
+}
+body {
+  font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.7;
+}
+h1 { font-size: 2rem; color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: .4rem; margin-top: 2.5rem; }
+h2 { font-size: 1.55rem; color: #1e4a6b; border-bottom: 2px solid #c8d8e8; padding-bottom: .25rem; margin-top: 2.2rem; }
+h3 { font-size: 1.25rem; color: #2c5f8a; margin-top: 1.6rem; }
+h4 { font-size: 1.1rem; color: #444; margin-top: 1.2rem; }
+p { margin: .8rem 0; }
+pre {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 1rem; overflow-x: auto; font-size: .9rem; line-height: 1.5;
+}
+code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88em; background: #eee; padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+thead { background: var(--accent); color: #fff; }
+th, td { padding: .5rem .75rem; border: 1px solid var(--border); text-align: left; }
+tbody tr:nth-child(even) { background: #f9f9f9; }
+.callout {
+  padding: .75rem 1rem; border-radius: 6px; margin: 1rem 0; border-left: 5px solid;
+}
+.callout.warning { background: var(--warn-bg); border-color: var(--warn-border); }
+.callout.tip { background: var(--tip-bg); border-color: var(--tip-border); }
+.callout.expert { background: var(--expert-bg); border-color: var(--expert-border); }
+.callout-title { font-weight: 700; margin-bottom: .25rem; display: block; }
+.tag { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .78rem; color: #fff; margin-right: .4rem; }
+.tag-beginner { background: var(--tag-beginner); }
+.tag-intermediate { background: var(--tag-intermediate); }
+.tag-advanced { background: var(--tag-advanced); }
+.chapter-nav { display: flex; justify-content: space-between; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.chapter-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+footer { text-align: center; color: #888; font-size: .85rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<h1>第19章 Sandbox与实验模块</h1>
+<p><span class="tag tag-advanced">Advanced</span> <span class="tag tag-intermediate">Experimental</span></p>
+
+<p>
+<code>oggm/sandbox/</code> 目录包含了一系列实验性、面向研究且成熟度较低的模块。与核心 OGGM 包不同，sandbox 模块不受相同的 API 稳定性保证、全面测试或性能基准的约束。它们充当新物理机制、替代参数化方案、教育工具和跨模型兼容层的试验场。本章概述 sandbox 的内容，解释 sandbox 模块与核心模块的区别，并提供何时以及如何使用它们的指导。
+</p>
+
+<h2>19.1 Sandbox 的设计理念</h2>
+
+<p>
+sandbox 是 OGGM 架构中经过深思熟虑的设计选择。冰川建模是一个活跃的研究领域，新方法不断在文献中出现。OGGM 没有将每一项新技术立即集成到稳定的核心中（那样将需要无限期地维护向后兼容性），而是提供了一个 sandbox，让贡献者可以自由地进行实验。
+</p>
+
+<h3>19.1.1 核心模块 vs. Sandbox 模块：关键区别</h3>
+
+<table>
+<thead><tr><th>标准</th><th>核心模块</th><th>Sandbox 模块</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>API 稳定性</strong></td>
+  <td>语义化版本控制；移除前需要弃用周期</td>
+  <td>无稳定性保证；可能在版本间变更或消失</td>
+</tr>
+<tr>
+  <td><strong>测试覆盖率</strong></td>
+  <td>合并前需要单元测试；CI 门控</td>
+  <td>测试可选或极少；可能依赖手动验证</td>
+</tr>
+<tr>
+  <td><strong>文档</strong></td>
+  <td>Sphinx 文档字符串 + 用户指南条目</td>
+  <td>极少；通常仅有源码注释或 notebook</td>
+</tr>
+<tr>
+  <td><strong>参数处理</strong></td>
+  <td>在 <code>params.cfg</code> 中注册并设置默认值</td>
+  <td>可能使用硬编码值或独立配置</td>
+</tr>
+<tr>
+  <td><strong>性能</strong></td>
+  <td>已做性能分析；期望进行大规模优化</td>
+  <td>"在我机器上能跑"是可接受的</td>
+</tr>
+<tr>
+  <td><strong>用途</strong></td>
+  <td>常用建模流程</td>
+  <td>研究探索、教学、模型对比</td>
+</tr>
+</tbody>
+</table>
+
+<div class="callout warning">
+<span class="callout-title">警告</span>
+未经彻底独立验证的 sandbox 模块不应用于已发表的科学成果。OGGM 开发者明确指出，sandbox 代码可能包含已知局限、未经验证的假设或数值不稳定性。
+</div>
+
+<div class="callout tip">
+<span class="callout-title">Sandbox风险分级</span>
+<table>
+<thead><tr><th>等级</th><th>可以怎样用</th><th>发表前最低要求</th></tr></thead>
+<tbody>
+<tr><td>教学/演示</td><td>帮助理解概念或快速画图</td><td>不要直接作为定量结论来源。</td></tr>
+<tr><td>论文复现实验</td><td>复现某篇论文或某个模块作者的实验</td><td>固定OGGM版本、记录参数、复现原始案例。</td></tr>
+<tr><td>方法探索</td><td>开发新参数化或比较替代方案</td><td>与核心工作流、观测或独立模型交叉验证。</td></tr>
+<tr><td>正式区域应用</td><td>不建议直接使用</td><td>需要测试、敏感性分析、误差评估和清晰的方法说明。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>19.2 模块：calving_fabi.py</h2>
+
+<p>
+<code>sandbox/calving_fabi.py</code> 实现了基于 Fabien Maussion 及其合作者研究的替代性崩解参数化方案。该模块提供的崩解速率估算在水深、应变率和锋面消融处理方面与核心 OGGM 崩解方案不同。
+</p>
+
+<h3>19.2.1 设计原理</h3>
+
+<p>
+崩解是冰川预测中最大的不确定性来源之一。核心 OGGM 模型使用简单的依赖水深的崩解率（即 "k-calving" 法则）。Fabi 参数化方案对此进行了扩展，包括：
+</p>
+<ul>
+  <li><strong>应变率依赖性：</strong>崩解率在纵向应变率较高的末端附近增加。</li>
+  <li><strong>浮力驱动崩解：</strong>考虑了当末端接近漂浮状态时海洋对水上冰崖施加的扭矩。</li>
+  <li><strong>宽度依赖性效应：</strong>峡湾几何形态通过侧向拖曳和应力集中来调节崩解。</li>
+</ul>
+
+<h3>19.2.2 关键函数</h3>
+
+<h4>calving_rate_fabi()</h4>
+<pre><code>def calving_rate_fabi(gdir, calving_water_level='Lmax',
+                      use_beta=False, glen_a=None,
+                      write=True, filesuffix=''):
+    """Compute calving rate using the Fabi parameterization.
+
+    Parameters
+    ----------
+    gdir : GlacierDirectory
+        The glacier directory (must have inversion_output.pkl).
+    calving_water_level : str or float
+        Water level reference: 'Lmax' (last observed), 'L0' (bed topo),
+        or a fixed elevation value.
+    use_beta : bool
+        If True, include strain-rate-dependent calving.
+    glen_a : float, optional
+        Override the default Glen A parameter for this computation.
+    write : bool
+        If True, save calving output to the glacier directory.
+    filesuffix : str
+        Suffix appended to output filenames for multi-scenario runs.
+
+    Returns
+    -------
+    dict
+        Dictionary containing calving_rate (m/yr), calving_flux (km3/yr),
+        and per-flowline diagnostics.
+    """</code></pre>
+
+<h4>calving_flux_from_depth_fabi()</h4>
+<pre><code>def calving_flux_from_depth_fabi(gdir, water_level=None,
+                                    glen_a=None, write=False):
+    """Compute the total frontal calving flux using the Fabi approach."""</code></pre>
+
+<h3>19.2.3 使用示例</h3>
+<pre><code>import oggm
+from oggm import workflow
+from oggm.sandbox import calving_fabi
+
+# Standard OGGM preprocessing
+cfg.initialize()
+gdirs = workflow.init_glacier_directories(['RGI60-11.00897'])
+workflow.execute_entity_task(workflow.gis_prepro_tasks, gdirs)
+workflow.execute_entity_task(workflow.climate_tasks, gdirs)
+workflow.execute_entity_task(workflow.inversion_tasks, gdirs)
+
+# Apply Fabi calving with strain-rate dependence
+for gdir in gdirs:
+    result = calving_fabi.calving_rate_fabi(
+        gdir, use_beta=True, calving_water_level='Lmax'
+    )
+    print(f"Calving rate: {result['calving_rate']:.1f} m/yr")
+    print(f"Calving flux: {result['calving_flux']:.4f} km³/yr")</code></pre>
+
+<h2>19.3 模块：calving_jan.py</h2>
+
+<p>
+<code>sandbox/calving_jan.py</code> 提供了另一种崩解参数化方案，由 Jan-Hendrik Malles 开发。该方法强调水下融化和峡湾环流在驱动海洋终止型冰川崩解中的作用。
+</p>
+
+<h3>19.3.1 概念模型</h3>
+
+<p>
+Jan 崩解方案将崩解视为以下因素的产物：
+</p>
+<ol>
+  <li><strong>水下融化掏蚀：</strong>海洋热通量侵蚀末端的淹没部分，形成突出的悬垂冰体，最终发生力学破坏。</li>
+  <li><strong>热刻槽破坏：</strong>当融化导致的刻槽深度超过冰厚的临界比例时，水上冰崖发生崩塌。</li>
+  <li><strong>崩解率-融化率比值：</strong>崩解率被参数化为水下融化率的函数，采用经验推导的比例常数。</li>
+</ol>
+
+<h3>19.3.2 关键函数</h3>
+<pre><code>def calving_rate_from_depth_jan(gdir, melt_f=None, water_level=0,
+                                 write=True, filesuffix=''):
+    """Calving rate based on submarine melt undercutting.
+
+    The calving rate C is computed as:
+        C = k_m * m_dot * (d / H)
+    where k_m is an empirical constant, m_dot is the submarine melt rate,
+    d is water depth, and H is terminus ice thickness.
+
+    Parameters
+    ----------
+    gdir : GlacierDirectory
+    melt_f : float, optional
+        Submarine melt factor. If None, uses cfg.PARAMS['melt_f'].
+    water_level : float
+        Reference water level elevation (m a.s.l.).
+    write : bool
+    filesuffix : str
+
+    Returns
+    -------
+    dict with 'calving_rate' and 'calving_flux' keys.
+    """</code></pre>
+
+<h3>19.3.3 崩解方法的比较</h3>
+
+<table>
+<thead><tr><th>特性</th><th>核心 k-calving</th><th>Fabi (calving_fabi)</th><th>Jan (calving_jan)</th></tr></thead>
+<tbody>
+<tr><td>主要驱动</td><td>水深</td><td>水深 + 应变率</td><td>水下融化</td></tr>
+<tr><td>参数</td><td>calving_k</td><td>calving_k, glen_a, beta</td><td>melt_f, k_m</td></tr>
+<tr><td>峡湾几何</td><td>否</td><td>宽度效应（可选）</td><td>否</td></tr>
+<tr><td>计算成本</td><td>低</td><td>中</td><td>低</td></tr>
+<tr><td>验证程度</td><td>多区域</td><td>有限区域</td><td>单一峡湾</td></tr>
+</tbody>
+</table>
+
+<h2>19.4 模块：distribute_2d.py</h2>
+
+<p>
+<code>sandbox/distribute_2d.py</code> 解决了流线模型的一个根本性局限：如何从一维流线反演结果重建二维冰厚场。这是将 OGGM 与区域气候模型耦合或在完整二维网格上可视化冰川几何形态的关键步骤。
+</p>
+
+<h3>19.4.1 分布问题</h3>
+
+<p>
+OGGM 沿一维流线运行其质量守恒反演。结果是<em>沿</em>每条流线的厚度剖面。要获得网格化产品，必须将厚度横向"分布"到整个冰川集水区。这是一个欠定问题：无限多个二维场可以投影到同一个一维剖面上。
+</p>
+
+<h3>19.4.2 算法</h3>
+
+<h4>distribute_thickness_per_altitude()</h4>
+<pre><code>def distribute_thickness_per_altitude(gdir, varname='distributed_thickness',
+                                       add_slope=True,
+                                       smooth_radius=None):
+    """Distribute flowline thickness to each grid point.
+
+    Algorithm:
+    1. Compute distance-to-flowline for every grid cell.
+    2. At each altitude band, assign the flowline thickness value.
+    3. Optionally add a slope-dependent correction (thicker in concave areas).
+    4. Optionally smooth the result with a Gaussian filter.
+
+    Parameters
+    ----------
+    gdir : GlacierDirectory
+    varname : str
+        Name of output grid variable.
+    add_slope : bool
+        Include slope-dependent thickness correction.
+    smooth_radius : float, optional
+        Smoothing kernel radius in meters.
+    """</code></pre>
+
+<h4>distribute_thickness_interp()</h4>
+<pre><code>def distribute_thickness_interp(gdir, add_slope=True,
+                                 smooth_radius=None):
+    """Alternative interpolation-based distribution method.
+
+    Uses inverse-distance-weighted interpolation from the flowline
+    centerline outward, rather than altitude-band assignment.
+    """</code></pre>
+
+<h3>19.4.3 使用示例</h3>
+<pre><code>from oggm.sandbox import distribute_2d
+
+# After running inversion...
+for gdir in gdirs:
+    distribute_2d.distribute_thickness_per_altitude(
+        gdir, add_slope=True, smooth_radius=200
+    )
+    # Now gdir.gridded_data has 'distributed_thickness' variable</code></pre>
+
+<div class="callout tip">
+<span class="callout-title">提示：验证</span>
+二维分布厚度可以通过将其投影回流线并与原始一维反演进行比较来验证。一维和二维表示之间总冰体积的守恒也是一个有用的诊断指标。
+</div>
+
+<h2>19.5 模块：edu.py</h2>
+
+<p>
+<code>sandbox/edu.py</code> 是一个专为冰川动力学教学而设计的教育模块。它实现了简化的、解析可解的冰川模型，可以在 Jupyter notebook 中交互运行，无需完整的 OGGM 预处理流程。
+</p>
+
+<h3>19.5.1 教育模型</h3>
+
+<h4>IdealisedBedrock</h4>
+<pre><code>class IdealisedBedrock:
+    """A simple, analytically-defined bedrock profile.
+
+    Supports:
+    - Linear beds: z_b(x) = z_max - slope * x
+    - Parabolic beds: z_b(x) = z_max - (z_max - z_min) * (x/L)²
+    - Custom polynomial beds
+
+    Parameters
+    ----------
+    top_z : float
+        Elevation at the head (m).
+    bottom_z : float
+        Elevation at the terminus (m).
+    width : float
+        Constant glacier width (m).
+    length_km : float
+        Glacier length (km).
+    """</code></pre>
+
+<h4>BumpedBedrock（前身为 IdealisedGlacier）</h4>
+<pre><code>class BumpedBedrock(IdealisedBedrock):
+    """Adds a Gaussian bump to the bedrock for more realistic geometry."""</code></pre>
+
+<h4>ShallowIceApproximationModel</h4>
+<pre><code>class ShallowIceApproximationModel:
+    """A didactic implementation of the SIA glacier model.
+
+    This model explicitly shows the physics without the optimization
+    complexity of the production FluxBasedModel. Students can read
+    the source code and understand every line.
+
+    The model solves:
+      ∂H/∂t = -∂(u_bar * H * w)/∂x / w + b_dot
+    where u_bar is the depth-averaged velocity from the SIA.
+    """</code></pre>
+
+<h3>19.5.2 面向教学的设计</h3>
+
+<p><code>edu.py</code> 的主要教育特性：</p>
+<ul>
+  <li><strong>透明的数值方法：</strong>无黑箱求解器；采用显式时间步进，并带有清晰的 CFL 条件检查。</li>
+  <li><strong>内置诊断：</strong>物质平衡、通量散度和速度作为独立的、命名的步骤进行计算，学生可以检查每一步。</li>
+  <li><strong>Jupyter 友好：</strong>所有类都有显示关键状态的 <code>__repr__</code> 方法和用于内联可视化的 <code>plot()</code> 方法。</li>
+  <li><strong>渐进复杂度：</strong>从恒定物质平衡的平衡剖面开始，添加季节性，添加物质平衡-海拔反馈，最后添加气候趋势。</li>
+</ul>
+
+<h3>19.5.3 示例：运行教育模拟</h3>
+<pre><code>from oggm.sandbox.edu import BumpedBedrock, ShallowIceApproximationModel
+import numpy as np
+
+# Create an idealized glacier geometry
+bed = BumpedBedrock(
+    top_z=3600, bottom_z=1200, width=300, length_km=10,
+    bump_amplitude=100, bump_position=0.4
+)
+
+# Initialize the SIA model
+model = ShallowIceApproximationModel(
+    bed=bed, nx=200, glen_a=2.4e-24,
+    mb_model='seasonal', ela=2800
+)
+
+# Run to equilibrium
+model.run_to_equilibrium(rtol=1e-3, max_years=500)
+
+# Plot the profile
+model.plot(title="Equilibrium Glacier Profile")
+
+# Inspect mass budget
+print(f"Total volume: {model.volume_km3:.3f} km³")
+print(f"Max thickness: {model.thickness.max():.1f} m")
+print(f"ELA: {model.ela:.0f} m a.s.l.")</code></pre>
+
+<h2>19.6 模块：pygem_compat.py</h2>
+
+<p>
+<code>sandbox/pygem_compat.py</code> 提供了 OGGM 与 PyGEM（Python Glacier Evolution Model，由 David Rounce 及其合作者开发）之间的兼容层。PyGEM 是一个独立的冰川模型，常用于全球尺度的预测，在模型对比研究中经常与 OGGM 一起被引用。
+</p>
+
+<h3>19.6.1 目的</h3>
+
+<p>该兼容层支持以下功能：</p>
+<ul>
+  <li><strong>输入协调：</strong>将 OGGM 冰川目录（GlacierDirectory）转换为 PyGEM 期望的输入格式（反之亦然）。</li>
+  <li><strong>参数转换：</strong>在 OGGM 物质平衡参数（melt_f、temp_bias、prcp_fac）与 PyGEM 的参数化方案之间进行映射。</li>
+  <li><strong>跨模型验证：</strong>在相同冰川上运行两个模型，使用相同的气候强迫，并比较结果。</li>
+  <li><strong>集合生成：</strong>将 PyGEM 的体积-面积缩放方法作为低成本集合成员，与 OGGM 的流线物理模型并行使用。</li>
+</ul>
+
+<h3>19.6.2 关键函数</h3>
+
+<h4>convert_oggm_to_pygem()</h4>
+<pre><code>def convert_oggm_to_pygem(gdir, output_dir=None):
+    """Convert OGGM GlacierDirectory into PyGEM input format.
+
+    Extracts: RGI metadata, hypsometry, climate timeseries,
+    and ice thickness (if available).
+
+    Parameters
+    ----------
+    gdir : GlacierDirectory
+    output_dir : str, optional
+        Directory for PyGEM input files.
+
+    Returns
+    -------
+    dict
+        PyGEM-compatible glacier dictionary.
+    """</code></pre>
+
+<h4>run_pygem_from_oggm()</h4>
+<pre><code>def run_pygem_from_oggm(gdir, pygem_params=None,
+                         n_years=None, output_dir=None):
+    """Run PyGEM model from an OGGM glacier directory.
+
+    Handles all data conversion internally and returns results
+    in a standardized format for comparison.
+    """</code></pre>
+
+<h4>compare_oggm_pygem()</h4>
+<pre><code>def compare_oggm_pygem(gdir, oggm_run_output=None,
+                       pygem_run_output=None):
+    """Generate a diagnostic comparison between OGGM and PyGEM runs.
+
+    Returns a DataFrame with annual values of:
+    - Specific mass balance
+    - Volume change
+    - Area change
+    for both models.
+    """</code></pre>
+
+<h2>19.7 其他 Sandbox 模块</h2>
+
+<p>除上述主要模块外，sandbox 还包含若干较小的工具：</p>
+
+<h3>sandbox/gmd_paper_mbcrossval.py</h3>
+<p>
+实现了 OGGM GMD 论文中描述的物质平衡交叉验证方法。该模块系统地测试校准后的物质平衡参数对不同校准周期、参考数据集和冰川子集的敏感性。
+</p>
+
+<h3>sandbox/grindelwald_demo.py</h3>
+<p>
+一个演示 notebook 配套文件，对 Grosser Aletschgletscher 及其他瑞士冰川的历史演变进行建模。展示了如何为具有长期物质平衡和长度变化记录的、观测充分的冰川设置 OGGM。
+</p>
+
+<h3>sandbox/idealisepy_glaciers.py（遗留）</h3>
+<p>
+<code>edu.py</code> 的前身，保留以兼容引用旧类名的 notebook。
+</p>
+
+<h2>19.8 何时使用 Sandbox 模块</h2>
+
+<table>
+<thead><tr><th>使用场景</th><th>推荐模块</th><th>注意事项</th></tr></thead>
+<tbody>
+<tr>
+  <td>格陵兰研究的替代崩解方案</td>
+  <td><code>calving_fabi.py</code></td>
+  <td>需先用观测数据验证</td>
+</tr>
+<tr>
+  <td>水下融化驱动崩解（阿拉斯加）</td>
+  <td><code>calving_jan.py</code></td>
+  <td>融化速率参数约束较差</td>
+</tr>
+<tr>
+  <td>用于区域气候模型的二维厚度图</td>
+  <td><code>distribute_2d.py</code></td>
+  <td>分布过程增加不确定性；需量化</td>
+</tr>
+<tr>
+  <td>向学生教授冰川动力学</td>
+  <td><code>edu.py</code></td>
+  <td>不适合定量预测</td>
+</tr>
+<tr>
+  <td>与 PyGEM 的跨模型对比</td>
+  <td><code>pygem_compat.py</code></td>
+  <td>需要安装 PyGEM</td>
+</tr>
+</tbody>
+</table>
+
+<h2>19.9 为 Sandbox 贡献代码</h2>
+
+<p>OGGM 欢迎 sandbox 贡献。sandbox 的纳入门槛比核心模块低：</p>
+<ul>
+  <li>代码必须在演示冰川（Hintereisferner 和至少一个入海型冰川）上无错误运行。</li>
+  <li>包含一个演示用法的 Jupyter notebook。</li>
+  <li>在模块顶部添加说明，描述目的、参考文献和已知局限。</li>
+  <li>如果模块趋于成熟（获得了测试、文档和社区验证），则可能被提升为核心包。</li>
+</ul>
+
+<div class="chapter-nav">
+  <span></span>
+  <a href="ch20.html">第20章 扩展OGGM →</a>
+</div>
+
+<footer>
+  OGGM 源码深度解析 &mdash; 第19章 Sandbox与实验模块
+</footer>
+
+</body>
+</html>

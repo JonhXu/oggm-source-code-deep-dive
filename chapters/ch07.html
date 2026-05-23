@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第7章 气候数据处理与Shop模块 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第7章 气候数据处理与Shop模块</h1>
+
+<p>
+<code>climate.py</code>（约384行）和 <code>shop/</code> 模块共同构成了OGGM的气候数据供应链。不同于地表高程数据（以单个GeoTIFF形式直接可用），气候数据来自多个来源——CRU TS、ERA5、GSWP3-W5E5、CMIP5/6 GCMs——格式各异，需要统一处理为标准化版本才能提供给物质平衡模型。本章深入解析这一数据标准化工作流的每个环节。
+</p>
+
+<div class="callout tip">
+  <div class="callout-title">交叉方向读者先看这里</div>
+  <p>如果你的目标是把站点气象、区域再分析或水文模型气候输入接入OGGM，最低要求是准备月尺度温度、月总降水、参考高程和时间坐标。先让数据写成OGGM标准的<code>climate_historical.nc</code>，再进入第8章物质平衡模型；不要直接跳到动力学模拟。</p>
+</div>
+
+<div class="callout warning">
+  <div class="callout-title">高亚洲气候数据提醒</div>
+  <p>青藏高原、天山、祁连山等区域的降水低估和高程订正误差常常比动力学参数误差更先控制结果。使用默认气候数据时，应检查<code>prcp_fac</code>、<code>temp_bias</code>、参考高程和物质平衡校准结果，并尽量用本地观测或区域产品进行独立验证。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>7.1 气候数据架构概览</h2>
+
+<p>
+OGGM将气候数据生产划分为两个层级：<code>climate.py</code> 作为顶层调度器，接受源格式的NetCDF文件并写出标准化的<code>climate_historical.nc</code>；<code>shop/</code> 下的各模块负责从原始数据源下载和初步预处理——即"数据获取层"和"格式标准化层"的分离。
+</p>
+
+<p>完整数据流如下：</p>
+
+<pre><code>Shop模块（获取与初步处理）
+    │
+    ├── shop/cru.py     → CRU TS 4.04 月异常 + CRU CL2 气候场
+    ├── shop/w5e5.py    → GSWP3-W5E5 重分析
+    ├── shop/ecmwf.py   → ERA5 / ERA5-Land / CERA-20C
+    ├── shop/gcm_climate.py → CMIP5/6 / CESM-LME / ISIMIP
+    │
+    ▼
+climate.py（标准化处理）
+    │
+    ▼
+climate_historical.nc  →  MassBalanceModel (第8章)
+</code></pre>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout tip">
+  <div class="callout-title">为什么要标准化气候格式？</div>
+  <p>
+    不同气候数据集的时间分辨率和空间参考各不相同：CRU是月均0.5度网格，ERA5是小时级0.25度网格，CMIP6 GCM可能达到1.5度。标准化过程将所有数据统一为OGGM要求的月均NetCDF格式（变量：temp, prcp, ref_hgt, time），并与冰川的高度带对齐。这种标准化使物质平衡模型可以被"可插拔"的气候数据源驱动。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>7.2 标准化NetCDF格式</h2>
+
+<p>
+<code>write_monthly_climate_file</code> 定义了所有气候文件的标准Schema：
+</p>
+
+<table>
+  <thead>
+    <tr><th>变量</th><th>维度</th><th>单位</th><th>描述</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>temp</code></td><td>(time,)</td><td>deg C</td><td>月均温度</td></tr>
+    <tr><td><code>prcp</code></td><td>(time,)</td><td>kg m<sup>-2</sup> month<sup>-1</sup> (即 mm month<sup>-1</sup>)</td><td>月总降水量</td></tr>
+    <tr><td><code>ref_hgt</code></td><td>标量</td><td>m</td><td>参考高程（温度对应的海拔）</td></tr>
+    <tr><td><code>time</code></td><td>(time,)</td><td>days since 1800-01-01</td><td>CF惯用的时间编码</td></tr>
+    <tr><td><code>gradient</code></td><td>(time,)</td><td>K m<sup>-1</sup></td><td>温度梯度（可选，否则用-0.0065 K/m）</td></tr>
+  </tbody>
+</table>
+
+<p>
+注意降水不是速率（mm/s），而是月累积量（mm/month）。这使得在物质平衡中可以直接乘以物质平衡天数估算月度融化与积累。温度以摄氏度（而非开尔文）为单位，避免了在每次物质平衡计算中都要减去273.15。
+</p>
+
+<!-- ================================================================== -->
+<h2>7.3 顶层调度函数（process_climate_data）</h2>
+
+<p>
+<code>process_climate_data</code>（约第138-222行）根据 <code>cfg.PARAMS['baseline_climate']</code> 的设置路由不同的处理策略：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">process_climate_data</span>(<span class="dec">gdir</span>):
+    <span class="dec">src</span> = cfg.PARAMS[<span class="str">'baseline_climate'</span>]
+
+    <span class="kw">if</span> <span class="dec">src</span> == <span class="str">'CRU'</span>:
+        <span class="cmt"># 从CRU CL2 + CRU TS构建</span>
+        process_cru_data(gdir)
+    <span class="kw">elif</span> <span class="dec">src</span> == <span class="str">'ERA5'</span>:
+        <span class="cmt"># 从ECMWF ERA5构建</span>
+        process_ecmwf_data(gdir)
+    <span class="kw">elif</span> <span class="dec">src</span> == <span class="str">'W5E5'</span>:
+        <span class="cmt"># 从GSWP3-W5E5构建</span>
+        process_w5e5_data(gdir)
+    <span class="kw">elif</span> <span class="dec">src</span> == <span class="str">'CUSTOM'</span>:
+        <span class="cmt"># 用户提供的NetCDF</span>
+        process_custom_climate_data(gdir)
+    <span class="kw">elif</span> <span class="dec">src</span> == <span class="str">'HISTALP'</span>:
+        <span class="cmt"># 欧洲山地HISTALP数据集</span>
+        process_histalp_data(gdir)</code></pre>
+
+<p>
+<code>process_custom_climate_data</code>（约第36-135行）是通用入口：读取用户提供的NetCDF文件，验证变量、单位和维度，然后执行必要的最近邻空间插值和垂直外推。
+</p>
+
+<!-- ================================================================== -->
+<h2>7.4 历史Delta方法</h2>
+
+<p>
+<code>historical_delta_method</code>（约第225-383行）是处理"混合气候数据集"的核心技术——当你有两个不同时期、空间分辨率或精度的气候源时如何将它们融合。该方法广泛应用于CRU（将低分辨率CRU TS异常叠加到高分辨率CRU CL2气候场上）。
+</p>
+
+<h3>7.4.1 温度：加法异常</h3>
+
+<p>对温度使用可加性异常（anomaly）：</p>
+
+<pre><code>T_<span class="dec">recon</span>(t) = T_clim + (T_obs(t) - T_obs_clim)</code></pre>
+
+<p>即：目标温度的长期平均 + 观测异常。这里隐含假设温度异常在不同空间分辨率下是保守的——0.5度网格上的年际温度距平可以合理地放在更细网格的30年平均场上。这个假设在大多数山地气候中成立。</p>
+
+<h3>7.4.2 降水：乘法缩放</h3>
+
+<p>对降水首选乘法（比率）缩放：</p>
+
+<pre><code>P_<span class="dec">recon</span>(t) = P_clim * (P_obs(t) / P_obs_clim)</code></pre>
+
+<p>比率法隐含假设降水的相对变化（而非绝对变化）在不同分辨率下是保守的。当<code>P_obs_clim</code>接近零时（如干旱月份），<code>/</code> 会导致数值爆炸。此时会降级为加法异常法（<code>fallback='additive'</code>）。
+</p>
+
+<h3>7.4.3 混合数据集</h3>
+
+<p>当两个数据集有重叠时间窗口时（如CERA-20C覆盖1901-2010，ERA5覆盖1950-至今），会先计算重叠期偏差，再合并时间序列。标准差缩放通过滚动窗口确保合并后的方差连续性。</p>
+
+<!-- ================================================================== -->
+<h2>7.5 Shop模块：CRU TS</h2>
+
+<p>
+<code>shop/cru.py</code> 实现了经典的CRU TS方案。CRU CL2提供1961-1990年的30年平均气候场（10'分辨率 ~18km格网），CRU TS 4.04提供1901年以来的月异常（0.5度分辨率）。
+</p>
+
+<h3>7.5.1 3x3窗口选择</h3>
+
+<p>
+对于每条冰川，在不规则CRU网格中选择距离冰川质心最近的3x3=9个格点单元。每个单元包含该月异常的时间序列。
+</p>
+
+<h3>7.5.2 异常插值</h3>
+
+<p>
+9个CRU TS格点上的异常通过三线性插值（经度、纬度、月份维度）映射到CRU CL2细网格的每个格点——这是一种coarse-to-fine的方案。最后取冰川质心所在CRU CL2格点的12个月温度场，叠加CRU TS异常，得到完整的1901至今的月气候序列。
+</p>
+
+<!-- ================================================================== -->
+<h2>7.6 Shop模块：W5E5 / GSWP3-W5E5</h2>
+
+<p>
+<code>shop/w5e5.py</code> 处理GSWP3-W5E5数据集——这是目前最受欢迎的气候驱动数据之一，覆盖1901-2019年（之后延续至ERA5），使用0.5度分辨率。数据存储为"pre-flattened"格式（已将二维格网展平为一维数组存储于NetCDF中），通过最近邻选择找到冰川对应的格点。
+</p>
+
+<p>单位转换是W5E5处理的关键步骤：</p>
+
+<pre><code><span class="cmt"># W5E5原始数据单位</span>
+temp_raw = ...  <span class="cmt"># 开尔文 [K]</span>
+prcp_raw = ...  <span class="cmt"># kg m^{-2} s^{-1} (降水速率)</span>
+
+<span class="cmt"># 转换为OGGM标准单位</span>
+temp_C = temp_raw - <span class="dec">273.15</span>           <span class="cmt"># K → °C</span>
+prcp_mm = prcp_raw * <span class="dec">86400</span> * <span class="dec">days_in_month</span>  <span class="cmt"># kg m-2 s-1 → mm month-1</span></code></pre>
+
+<p>
+在pre-flattened格式中，格点的索引已预先计算、存储，直接读取一行即可获取该格点的全部时间序列，将IO开销降至最低。
+</p>
+
+<!-- ================================================================== -->
+<h2>7.7 Shop模块：ECMWF</h2>
+
+<p>
+<code>shop/ecmwf.py</code> 是最复杂的shop模块之一，需处理四种ECMWF数据产品：
+</p>
+
+<table>
+  <thead>
+    <tr><th>数据集</th><th>分辨率</th><th>时间覆盖</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ERA5</td><td>0.25°</td><td>1950-至今</td><td>最常用的现代再分析</td></tr>
+    <tr><td>ERA5-Land</td><td>0.1°</td><td>1950-至今</td><td>陆地表面增强版，地形更精细</td></tr>
+    <tr><td>CERA-20C</td><td>1.125°</td><td>1901-2010</td><td>耦合气候再分析，10个集合成员</td></tr>
+    <tr><td>ERA5dr</td><td>0.25°</td><td>1950-至今</td><td>降尺度版本的ERA5 for 山地研究</td></tr>
+  </tbody>
+</table>
+
+<p>
+ECMWF数据以两种格式存储——"flattened"（时空展平）和标准gridded（四维：时间、垂直层、纬度、经度）。模块通过<code>auto_detect</code>机制识别格式，自动选择合适的读取路径。CERA-20C的10个集合成员通过取算术平均（ensemble mean）来处理。
+</p>
+
+<!-- ================================================================== -->
+<h2>7.8 Shop模块：GCM气候</h2>
+
+<p>
+<code>shop/gcm_climate.py</code> 处理全球气候模式（GCM）的输出，包括CMIP5/6、CESM-LME、LMR、ModE-RA等。这些数据的挑战在于：每个GCM有自己的气候态偏差（bias），直接使用原始输出会导致物质平衡偏差。
+</p>
+
+<h3>7.8.1 标准异常方法</h3>
+
+<p>OGGM采用"异常方法"消除GCM偏差：</p>
+
+<pre><code>T_recon(t) = T_ref_clim + (T_gcm(t) - T_gcm_clim)
+P_recon(t) = P_ref_clim * (P_gcm(t) / P_gcm_clim)</code></pre>
+
+<p>其中 <code>T_ref_clim</code> 和 <code>P_ref_clim</code> 来自观测/再分析参考场（如W5E5），<code>T_gcm_clim</code> 和 <code>P_gcm_clim</code> 是GCM在参考期（通常1980-2010）的自身气候态。这保留了GCM的年际变率和趋势信号，而使用参考数据的绝对值避免偏差影响物质平衡的绝对水平。</p>
+
+<h3>7.8.2 ISIMIP3b路径</h3>
+
+<p>
+对于CMIP6的ISIMIP3b数据，GCM输出已经过外部偏差校正（bias correction）。OGGM通过<code>apply_bias_correction=False</code>参数跳过自身的异常校正。ISIMIP3b是OGG-M/IPCC评估中的首选CMIP6数据源。
+</p>
+
+<!-- ================================================================== -->
+<h2>7.9 气候数据源比较</h2>
+
+<table>
+  <thead>
+    <tr><th>数据源</th><th>时期</th><th>分辨率</th><th>变量</th><th>Shop路径</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>CRU TS 4.04 + CL2</td><td>1901-2019</td><td>10' / 0.5°</td><td>T, P</td><td>shop/cru.py</td></tr>
+    <tr><td>GSWP3-W5E5</td><td>1901-2019</td><td>0.5°</td><td>T, P, SW↓, LW↓, etc.</td><td>shop/w5e5.py</td></tr>
+    <tr><td>ERA5</td><td>1950-至今</td><td>0.25°</td><td>T, P, SW↓, LW↓</td><td>shop/ecmwf.py</td></tr>
+    <tr><td>ERA5-Land</td><td>1950-至今</td><td>0.1°</td><td>T, P</td><td>shop/ecmwf.py</td></tr>
+    <tr><td>CERA-20C</td><td>1901-2010</td><td>1.125°</td><td>T, P</td><td>shop/ecmwf.py</td></tr>
+    <tr><td>CMIP5 GCMs</td><td>1861-2100</td><td>~1-2°</td><td>T, P</td><td>shop/gcm_climate.py</td></tr>
+    <tr><td>CMIP6 ISIMIP3b</td><td>1850-2100</td><td>0.5°</td><td>T, P</td><td>shop/gcm_climate.py</td></tr>
+    <tr><td>HISTALP</td><td>1800-2014</td><td>站点/区域</td><td>T, P</td><td>shop/histalp.py</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>7.10 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>默认值</th><th>作用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>baseline_climate</code></td><td><code>'W5E5'</code></td><td>历史基线气候数据选择</td></tr>
+    <tr><td><code>hydro_year_month</code></td><td>10（北半球）/ 5（南半球）</td><td>水文年开始月（与冰川年对齐）</td></tr>
+    <tr><td><code>temp_use_gradient</code></td><td><code>True</code></td><td>使用气候文件的温度梯度进行垂直外推</td></tr>
+    <tr><td><code>temp_default_gradient</code></td><td>-0.0065</td><td>默认温度递减率 (K/m)</td></tr>
+    <tr><td><code>climate_qc_max_months</code></td><td>3</td><td>插值前允许的最大缺测月数</td></tr>
+    <tr><td><code>clip_negative_prcp</code></td><td><code>True</code></td><td>将负降水值（数值误差）设为0</td></tr>
+    <tr><td><code>temp_bias</code></td><td>0.0（用户设定）</td><td>系统温度偏移（校准参数，单元K）</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>7.11 总结</h2>
+
+<p>
+<code>climate.py</code> 和 <code>shop/</code> 模块是OGGM的"数据桥梁"——将来源各异的气候数据源转化为统一的、可直接用于物质平衡模型的格式。历史Delta方法体现了气候数据融合中的经典策略：长期气候场（来自高分辨率数据）+年际异常（来自长序列数据）的组合。理解这层转换逻辑，对于正确解读模型的物质平衡模拟至关重要——尤其是当切换气候数据源时，温度偏差和降水比率的差异会系统性地改变模拟结果。
+</p>
+
+<p>
+下一章将直接使用这里生成的<code>climate_historical.nc</code>来构建物质平衡模型——从简单的线性模型到温度指数模型（temperature-index model）和完全的月分量模型。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch06.html">第6章：冰川中心线与几何参数化</a></span>
+  <span class="next"><a href="ch08.html">第8章：物质平衡模型</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

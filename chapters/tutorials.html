@@ -1,0 +1,1165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第22章 OGGM教程全集 — OGGM 源码深度解析</title>
+<style>
+:root {
+  --bg: #fffdf8; --fg: #1a1a1a; --accent: #2c5f8a; --accent-light: #e8f0f7;
+  --warn-bg: #fff3cd; --warn-border: #e6b422; --tip-bg: #d4edda; --tip-border: #28a745;
+  --expert-bg: #e2d8f0; --expert-border: #6f42c1; --code-bg: #f4f4f4; --border: #ddd;
+  --tag-beginner: #28a745; --tag-intermediate: #fd7e14; --tag-advanced: #dc3545;
+}
+body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg); line-height: 1.7; }
+h1 { font-size: 2rem; color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: .4rem; margin-top: 2.5rem; }
+h2 { font-size: 1.55rem; color: #1e4a6b; border-bottom: 2px solid #c8d8e8; padding-bottom: .25rem; margin-top: 2.2rem; }
+h3 { font-size: 1.25rem; color: #2c5f8a; margin-top: 1.6rem; }
+h4 { font-size: 1.1rem; color: #444; margin-top: 1.2rem; }
+p { margin: .8rem 0; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: .9rem; line-height: 1.5; }
+code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88em; background: #eee; padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+thead { background: var(--accent); color: #fff; }
+th, td { padding: .5rem .75rem; border: 1px solid var(--border); text-align: left; }
+tbody tr:nth-child(even) { background: #f9f9f9; }
+.callout { padding: .75rem 1rem; border-radius: 6px; margin: 1rem 0; border-left: 5px solid; }
+.callout.warning { background: var(--warn-bg); border-color: var(--warn-border); }
+.callout.tip { background: var(--tip-bg); border-color: var(--tip-border); }
+.callout.expert { background: var(--expert-bg); border-color: var(--expert-border); }
+.callout-title { font-weight: 700; margin-bottom: .25rem; display: block; }
+.tag { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .78rem; color: #fff; margin-right: .4rem; }
+.tag-beginner { background: var(--tag-beginner); }
+.tag-intermediate { background: var(--tag-intermediate); }
+.tag-advanced { background: var(--tag-advanced); }
+.chapter-nav { display: flex; justify-content: space-between; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.chapter-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+footer { text-align: center; color: #888; font-size: .85rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+ul, ol { margin: .5rem 0 .5rem 1.5rem; }
+.tutorial-header { background: var(--accent-light); padding: 1rem 1.5rem; border-radius: 8px; margin: 1.5rem 0; }
+.tutorial-header h3 { margin-top: 0; color: #1e4a6b; }
+.code-note { background: #f7fbff; border: 1px solid #c8d8e8; border-left: 5px solid #2c5f8a; border-radius: 6px; padding: .65rem .9rem; margin: .8rem 0; font-size: .95rem; }
+.code-note strong { color: #1e4a6b; }
+.checklist td:first-child { font-weight: 700; color: #1e4a6b; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<h1>第22章 OGGM教程全集</h1>
+<p><span class="tag tag-beginner">初级</span> <span class="tag tag-intermediate">中级</span> <span class="tag tag-advanced">高级</span></p>
+
+<p>
+本章提供了一套完整的教程，涵盖OGGM的每个主要方面，从安装到高级专题（如动态预热（dynamic spinup）和入海型冰川建模）。
+教程中的代码分为三类：可以从空目录直接运行的完整脚本、需要沿用前面已经生成的<code>gdir/gdirs</code>对象的连续练习、以及用于解释思想的示意代码。每段关键代码前会说明依赖条件，读者不必把所有片段都视为可单独复制运行的脚本。
+</p>
+
+<div class="callout tip">
+<span class="callout-title">建议学习顺序</span>
+<p><strong>第一次接触OGGM：</strong>先跑教程1、4、5、6，目标是得到一条冰川的气候文件、物质平衡、反演厚度和历史模拟诊断。</p>
+<p><strong>需要做区域研究：</strong>再跑教程7，并把附录C作为输出文件速查表。</p>
+<p><strong>需要改模型或写论文方法部分：</strong>最后读教程8，并回到第8-13章核对物理假设和参数含义。</p>
+</div>
+
+<div class="callout warning">
+<span class="callout-title">代码运行约定</span>
+<p>本章默认你在Jupyter Notebook或一个干净的Python脚本中逐段运行。若跳读某个教程，请先检查该段是否已经定义了<code>cfg</code>、<code>workflow</code>、<code>tasks</code>、<code>gdir</code>或<code>gdirs</code>。如果没有，请回到该教程开头重新初始化工作目录和冰川目录（GlacierDirectory）。</p>
+</div>
+
+<div class="callout tip">
+<span class="callout-title">常用输出速查</span>
+<table class="checklist">
+<thead><tr><th>研究问题</th><th>主要文件或对象</th><th>常用变量</th><th>推荐章节</th></tr></thead>
+<tbody>
+<tr><td>冰川面积/长度变化</td><td><code>model_diagnostics.nc</code></td><td><code>area_m2</code>, <code>length_m</code></td><td>教程6，第18章，附录C</td></tr>
+<tr><td>冰储量和平均厚度</td><td><code>inversion_output.pkl</code>, <code>model_diagnostics.nc</code></td><td><code>volume</code>, <code>volume_m3</code>, <code>thickness</code></td><td>教程5，第9章</td></tr>
+<tr><td>物质平衡和ELA</td><td><code>mb_calib.json</code>, MB模型对象</td><td><code>melt_f</code>, <code>temp_bias</code>, <code>get_specific_mb</code>, <code>get_ela</code></td><td>教程4，第8章</td></tr>
+<tr><td>入海型冰川崩解</td><td><code>diagnostics.json</code>, <code>model_diagnostics.nc</code></td><td><code>calving_m3</code>, <code>calving_rate</code>, <code>calving_k</code></td><td>教程8，第12章</td></tr>
+<tr><td>区域批处理质量控制</td><td><code>diagnostics.json</code>, 任务日志</td><td><code>dem_source</code>, <code>error_task</code>, <code>run_dynamic_spinup_success</code></td><td>教程7，第15-16章</td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- ================================================================== -->
+<h2>教程一：入门指南</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>安装、基础设置与首次冰川模拟</h3>
+<p><span class="tag tag-beginner">初级</span> | 预计时间：30分钟 | 前置条件：Python 3.9+</p>
+</div>
+
+<h3>1.1 安装OGGM</h3>
+
+<p>OGGM可通过conda（推荐）和pip安装：</p>
+
+<pre><code># Option A: conda (recommended — handles all C dependencies)
+conda create -n oggm_env python=3.11
+conda activate oggm_env
+conda install -c conda-forge oggm-deps
+pip install oggm
+
+# Option B: pip-only (requires system GDAL and netCDF4 libs)
+pip install oggm
+
+# Option C: development install (for modifying OGGM source)
+git clone https://github.com/OGGM/oggm.git
+cd oggm
+pip install -e .</code></pre>
+
+<div class="callout warning">
+<span class="callout-title">安装与下载排错</span>
+<table class="checklist">
+<thead><tr><th>现象</th><th>通常原因</th><th>建议处理</th></tr></thead>
+<tbody>
+<tr><td>GDAL或netCDF4安装失败</td><td>系统库版本不匹配</td><td>优先使用conda-forge环境，不建议初学者使用纯pip安装地理空间依赖。</td></tr>
+<tr><td>初始化或预处理长时间无输出</td><td>正在下载RGI、DEM或气候辅助文件</td><td>第一次运行需要联网和缓存数据；可先用单条示例冰川测试，确认缓存目录有写入权限。</td></tr>
+<tr><td>下载失败或速度很慢</td><td>访问外部数据源不稳定</td><td>在稳定网络下先下载预处理数据；团队内可共享<code>~/.oggm</code>缓存或预处理GlacierDirectory。</td></tr>
+<tr><td>同一代码结果不同</td><td>OGGM版本、RGI版本、预处理级别（prepro level）或参数不同</td><td>在论文和脚本中记录OGGM版本、RGI版本、<code>from_prepro_level</code>、<code>prepro_border</code>和关键参数。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>1.2 基础设置</h3>
+
+<div class="code-note"><strong>可直接运行：</strong>这段代码只初始化OGGM和工作目录，不会真正处理冰川。</div>
+
+<pre><code>import oggm
+from oggm import cfg, workflow, utils
+
+# Step 1 — Initialize OGGM (load configuration)
+cfg.initialize()
+
+# Step 2 — Set the working directory (where glacier data will be stored)
+cfg.PATHS['working_dir'] = '/path/to/your/OGGM_data'
+
+# Step 3 — Enable multiprocessing (optional but recommended)
+cfg.PARAMS['use_multiprocessing'] = True</code></pre>
+
+<h3>1.3 你的第一个冰川：Hintereisferner</h3>
+
+<div class="code-note"><strong>可直接运行，但需要联网：</strong><code>from_prepro_level=0</code>表示从原始RGI和地形数据开始，第一次运行会下载数据。若只是学习后续流程，可把<code>from_prepro_level</code>改为官方已有的预处理级别（prepro level）。</div>
+
+<pre><code># Define a single glacier to work with
+rgi_ids = ['RGI60-11.00897']  # Hintereisferner, Austrian Alps
+
+# Create GlacierDirectory object(s)
+gdirs = workflow.init_glacier_directories(
+    rgi_ids,
+    from_prepro_level=0,  # start from scratch
+    prepro_border=10       # map border in pixels
+)
+
+print(f"Created {len(gdirs)} glacier directory")
+print(f"Glacier: {gdirs[0].rgi_id}")
+print(f"Area: {gdirs[0].rgi_area_km2:.2f} km²")
+print(f"Data directory: {gdirs[0].dir}")</code></pre>
+
+<p><strong>预期输出：</strong></p>
+<pre><code>Created 1 glacier directory
+Glacier: RGI60-11.00897
+Area: 8.45 km²
+Data directory: /path/to/OGGM_data/per_glacier/RGI60-11/RGI60-11.00/RGI60-11.00897</code></pre>
+
+<h3>1.4 运行预处理任务</h3>
+
+<pre><code># Run all GIS preprocessing tasks on the glacier
+workflow.execute_entity_task(workflow.gis_prepro_tasks, gdirs)
+
+# At this point, the glacier directory contains:
+# - outlines.shp (glacier outline)
+# - dem.tif (digital elevation model)
+# - glacier_grid.json (grid definition)
+# - gridded_data.nc (gridded topographic variables)
+# - centerlines.pkl (computed centerlines)
+# - model_flowlines.pkl (initialized flowlines)</code></pre>
+
+<h3>1.5 理解输出文件</h3>
+
+<p>让我们检查一下生成了什么：</p>
+
+<pre><code>import os
+
+gdir = gdirs[0]
+for fname in os.listdir(gdir.dir):
+    fpath = os.path.join(gdir.dir, fname)
+    size_kb = os.path.getsize(fpath) / 1024
+    print(f"  {fname:<40s} {size_kb:>8.1f} KB")
+
+# Inspect the gridded data
+import xarray as xr
+with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+    print("\nGridded data variables:")
+    for vn in ds.data_vars:
+        print(f"  {vn}: {ds[vn].shape}, {ds[vn].dtype}")</code></pre>
+
+<p><strong>预期输出（近似值）：</strong></p>
+<pre><code>  outlines.shp                                  12.3 KB
+  dem.tif                                      156.7 KB
+  glacier_grid.json                              0.5 KB
+  gridded_data.nc                               45.2 KB
+  centerlines.pkl                               23.1 KB
+  model_flowlines.pkl                           18.4 KB
+  diagnostics.json                               1.2 KB
+
+Gridded data variables:
+  topo: (107, 134), float64
+  glacier_mask: (107, 134), uint8
+  glacier_topo: (107, 134), float64
+  aspect: (107, 134), float64
+  slope: (107, 134), float64
+  dis: (107, 134), float64
+  catchment_mask: (107, 134), uint8</code></pre>
+
+<p>
+你现在已经完成了第一次OGGM预处理运行！冰川目录（GlacierDirectory）已准备好进行气候处理、冰厚反演和动力学模拟。
+请参阅<a href="ch05.html">第5章（GIS与DEM处理）</a>和<a href="ch06.html">第6章（中心线与几何参数化）</a>，深入了解每个任务的具体作用。
+</p>
+
+<!-- ================================================================== -->
+<h2>教程二：使用GlacierDirectory</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>创建、读取和管理GlacierDirectory对象</h3>
+<p><span class="tag tag-beginner">初级</span> | 预计时间：20分钟</p>
+</div>
+
+<h3>2.1 深入理解GlacierDirectory</h3>
+
+<pre><code>import oggm
+from oggm import cfg, utils, workflow
+
+cfg.initialize()
+cfg.PATHS['working_dir'] = '/tmp/oggm_tutorial'
+
+# Create a GlacierDirectory from an RGI shapefile
+rgi_file = utils.get_demo_file('Hintereisferner_RGI5.shp')
+gdir = utils.GlacierDirectory(rgi_file)
+
+# Key attributes
+print(f"RGI ID:       {gdir.rgi_id}")
+print(f"RGI version:  {gdir.rgi_version}")
+print(f"Name:         {gdir.rgi_name}")
+print(f"Area (km²):   {gdir.rgi_area_km2:.2f}")
+print(f"CenLat:       {gdir.cenlat:.3f}")
+print(f"CenLon:       {gdir.cenlon:.3f}")
+print(f"TerminusType: {gdir.terminus_type}")
+print(f"Data dir:     {gdir.dir}")</code></pre>
+
+<h3>2.2 BASENAMES系统</h3>
+
+<pre><code># BASENAMES provides standardized file names within a glacier directory
+from oggm import cfg
+
+print("Registered BASENAMES:")
+for key, (filename, desc) in cfg.BASENAMES.items():
+    print(f"  {key:<30s} → {filename:<30s} ({desc})")
+
+# Get the full path to any registered file type
+outline_path = gdir.get_filepath('outlines')
+grid_path = gdir.get_filepath('gridded_data')
+print(f"\nOutline file: {outline_path}")
+print(f"Gridded data: {grid_path}")
+
+# Check if a glacier has a particular file
+if gdir.has_file('climate_historical'):
+    print("Climate data is present")
+else:
+    print("Climate data not yet processed")</code></pre>
+
+<h3>2.3 读取和写入冰川数据</h3>
+
+<pre><code># Reading gridded data (NetCDF)
+import xarray as xr
+ds = xr.open_dataset(gdir.get_filepath('gridded_data'))
+glacier_topo = ds['glacier_topo'].values  # numpy array
+mask = ds['glacier_mask'].values.astype(bool)
+print(f"Glacier elevation range: {glacier_topo[mask].min():.0f} - "
+      f"{glacier_topo[mask].max():.0f} m a.s.l.")
+
+# Reading pickled objects
+centerlines = gdir.read_pickle('centerlines')
+print(f"Number of centerlines: {len(centerlines)}")
+
+# Reading JSON
+diagnostics = gdir.read_json('diagnostics')
+print(f"DEM source: {diagnostics.get('dem_source', 'unknown')}")
+
+# Writing custom data
+import json
+my_results = {'custom_metric': 42.0, 'rgi_id': gdir.rgi_id}
+gdir.write_json(my_results, 'my_custom_results')
+
+# Reading it back
+loaded = gdir.read_json('my_custom_results')
+print(f"Custom metric: {loaded['custom_metric']}")</code></pre>
+
+<div class="callout tip">
+<span class="callout-title">提示：目录结构</span>
+冰川RGI60-11.00897的GlacierDirectory位于
+<code>per_glacier/RGI60-11/RGI60-11.00/RGI60-11.00897/</code>。
+三级层级结构（区域/子区域/冰川）映射了RGI的组织结构，便于高效的目录遍历。
+详见<a href="ch04.html">第4章（GlacierDirectory）</a>的完整规范。
+</div>
+
+<h3>2.4 查找GlacierDirectory</h3>
+
+<pre><code># Get all existing glacier directories in the working directory
+all_gdirs = workflow.init_glacier_directories(
+    rgi_ids=None,  # None = all that exist on disk
+    from_prepro_level=0
+)
+print(f"Found {len(all_gdirs)} glacier directories")
+
+# Filter by RGI region
+alps_gdirs = workflow.init_glacier_directories(
+    rgi_ids=None,
+    from_prepro_level=0,
+    reset=False
+)
+alps_only = [g for g in alps_gdirs if g.rgi_region == '11']
+print(f"Alps glaciers: {len(alps_only)}")</code></pre>
+
+<!-- ================================================================== -->
+<h2>教程三：冰川预处理</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>GIS任务、中心线和流线——逐步详解</h3>
+<p><span class="tag tag-beginner">初级</span> | 预计时间：45分钟</p>
+</div>
+
+<h3>3.1 预处理工作流</h3>
+
+<p>
+函数 <code>gis_prepro_tasks(gdir)</code> 是一个便捷封装，可一次性运行所有预处理步骤。
+为了深入理解，下面我们逐步运行每个步骤：
+</p>
+
+<pre><code>import oggm
+from oggm import cfg, utils, workflow
+from oggm.core import gis, centerlines
+
+cfg.initialize()
+cfg.PATHS['working_dir'] = '/tmp/oggm_tutorial_prepro'
+
+# Start fresh
+gdir = utils.GlacierDirectory(utils.get_demo_file('Hintereisferner_RGI5.shp'))
+
+# Step 1: Define the glacier region on a local grid
+gis.define_glacier_region(gdir)
+print("1. Glacier region defined")
+
+# Step 2: Process the DEM (reproject, crop, fill gaps)
+gis.process_dem(gdir)
+print("2. DEM processed")
+
+# Step 3: Compute glacier masks
+gis.glacier_masks(gdir)
+print("3. Glacier masks computed")
+
+# Step 4: Compute gridded attributes (slope, aspect, distance)
+gis.gridded_attributes(gdir)
+print("4. Gridded attributes computed")</code></pre>
+
+<h3>3.2 中心线计算</h3>
+
+<pre><code># Step 5: Compute centerlines from the glacier mask
+centerlines.compute_centerlines(gdir)
+print("5. Centerlines computed")
+
+# Visualize centerlines (requires matplotlib)
+import matplotlib.pyplot as plt
+centerlines.visualize_centerlines(gdir, figsize=(10, 8),
+                                   use_flowlines=False)
+plt.title(f"Centerlines for {gdir.rgi_id}")
+plt.tight_layout()
+plt.show()
+
+# Step 6: Compute catchment areas for each centerline
+centerlines.catchment_area(gdir)
+print("6. Catchment areas computed")
+
+# Step 7: Compute downstream centerline connections
+centerlines.compute_downstream_line(gdir)
+print("7. Downstream lines computed")
+
+# Step 8: Determine flowline order and tributary structure
+centerlines.compute_downstream_bedshape(gdir)
+print("8. Downstream bed shape computed")</code></pre>
+
+<h3>3.3 流线初始化</h3>
+
+<pre><code># Step 9: Initialize the flowlines
+centerlines.initialize_flowlines(gdir)
+print("9. Flowlines initialized")
+
+# Inspect the flowlines
+fls = gdir.read_pickle('model_flowlines')
+for i, fl in enumerate(fls):
+    print(f"\nFlowline {i}:")
+    print(f"  Points: {len(fl.surface_h)}")
+    print(f"  Length: {fl.dis_on_line[-1]:.0f} m")
+    print(f"  Max width: {fl.widths.max():.0f} m")
+    print(f"  Min elevation: {fl.surface_h.min():.0f} m")
+    print(f"  Max elevation: {fl.surface_h.max():.0f} m")
+    if hasattr(fl, 'is_tributary'):
+        print(f"  Tributary: {fl.is_tributary}")
+    if hasattr(fl, 'flows_to'):
+        print(f"  Flows to: {fl.flows_to}")
+
+# Visualize the flowlines
+centerlines.visualize_centerlines(gdir, figsize=(10, 8),
+                                   use_flowlines=True)
+plt.title(f"Flowlines for {gdir.rgi_id}")
+plt.tight_layout()
+plt.show()</code></pre>
+
+<div class="callout warning">
+<span class="callout-title">常见陷阱：中心线质量</span>
+对于某些冰川几何形状（非常平坦、被碎屑覆盖或跃动型冰川），自动中心线算法可能产生不理想的结果。
+在继续之前，请使用 <code>visualize_centerlines()</code> 检查输出。如果中心线质量不佳，优先检查DEM、RGI边界和
+<code>border</code>设置；必要时再谨慎调整 <code>cfg.PARAMS['min_centerline_distance']</code> 等中心线参数。
+问题排查详见<a href="ch06.html">第6章（中心线）</a>。
+</div>
+
+<!-- ================================================================== -->
+<h2>教程四：气候数据与物质平衡</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>处理气候数据、校准和计算物质平衡</h3>
+<p><span class="tag tag-intermediate">中级</span> | 预计时间：40分钟</p>
+</div>
+
+<h3>4.1 处理气候数据</h3>
+
+<pre><code>import oggm
+from oggm import cfg, workflow
+from oggm.core import climate
+
+cfg.initialize()
+cfg.PATHS['working_dir'] = '/tmp/oggm_tutorial_climate'
+
+# Get a preprocessed glacier (skip the GIS steps for brevity)
+gdirs = workflow.init_glacier_directories(
+    ['RGI60-11.00897'],
+    from_prepro_level=2,
+    prepro_border=10
+)
+
+# Process climate data for the glacier
+workflow.execute_entity_task(climate.process_climate_data, gdirs)
+print("Climate data processed!")
+
+# Inspect the climate file
+import xarray as xr
+gdir = gdirs[0]
+with xr.open_dataset(gdir.get_filepath('climate_historical')) as ds:
+    print(f"Climate data time span: {ds.time.values[0]} to {ds.time.values[-1]}")
+    print(f"Variables: {list(ds.data_vars)}")
+    print(f"Temperature range: {ds['temp'].min().values:.1f} to "
+          f"{ds['temp'].max().values:.1f} °C")
+    print(f"Precipitation range: {ds['prcp'].min().values:.1f} to "
+          f"{ds['prcp'].max().values:.1f} kg m⁻²")
+    print(f"Ref height: {ds.ref_hgt.values:.0f} m")
+    print(f"Ref pixel area: {ds.ref_pix_area.values*1e-6:.2f} km²")</code></pre>
+
+<h3>4.2 计算物质平衡</h3>
+
+<div class="code-note"><strong>连续练习：</strong>这段依赖4.1生成的<code>climate_historical</code>和<code>mb_calib.json</code>。物质平衡模型内部常用冰当量速度（m ice s^-1），教程中的图轴用于教学展示，论文作图时请统一换算为mm w.e. yr⁻¹或m w.e. yr⁻¹。</div>
+
+<pre><code># Compute the monthly mass balance at reference heights
+mb_df = gdir.get_ref_mb_data()
+print("Mass balance at reference heights:")
+print(mb_df.describe())
+
+# Plot the mass balance profile
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Get a typical year's mass balance profile
+heights = np.linspace(
+    gdir.gridded_data['glacier_topo'].min(),
+    gdir.gridded_data['glacier_topo'].max(),
+    50
+)
+
+# Create a mass balance model
+from oggm.core.massbalance import PastMassBalance
+mb_model = PastMassBalance(gdir)
+
+# Compute annual MB profile for a specific year
+year = 2000
+annual_mb = mb_model.get_annual_mb(heights, year=year)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.plot(annual_mb, heights, 'b-', linewidth=2)
+ax.axvline(x=0, color='k', linestyle='--')
+ax.axhline(y=mb_model.get_ela(year=year), color='r', linestyle='--',
+           label=f"ELA = {mb_model.get_ela(year=year):.0f} m")
+ax.set_xlabel('Annual Mass Balance (kg m⁻² yr⁻¹)')
+ax.set_ylabel('Elevation (m a.s.l.)')
+ax.set_title(f'Mass Balance Profile — {year}')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()</code></pre>
+
+<h3>4.3 校准物质平衡模型</h3>
+
+<pre><code># OGGM automatically calibrates melt_f (temperature sensitivity)
+# during process_climate_data, but you can inspect the results:
+
+calib = gdir.read_json('mb_calib')
+print("Mass balance calibration parameters:")
+for key, val in calib.items():
+    print(f"  {key}: {val}")
+
+# The key parameters:
+# - melt_f: temperature melt factor (kg m⁻² K⁻¹ day⁻¹)
+# - temp_bias: temperature correction applied to match geodetic MB
+# - prcp_fac: precipitation correction factor
+
+# Compute the specific mass balance for a period
+from oggm.core.massbalance import MultipleFlowlineMassBalance
+mb_multi = MultipleFlowlineMassBalance(gdir)
+
+years = np.arange(1980, 2010)
+s_mb_list = []
+for yr in years:
+    ela = mb_multi.get_ela(year=yr)
+    s_mb = mb_multi.get_specific_mb(year=yr)
+    s_mb_list.append(s_mb)
+
+print(f"\nMean specific MB (1980-2010): {np.mean(s_mb_list):.2f} mm w.e. yr⁻¹")
+print(f"Mean ELA (1980-2010): {np.mean([mb_multi.get_ela(year=y) for y in years]):.0f} m")</code></pre>
+
+<div class="callout expert">
+<span class="callout-title">高级：自定义校准</span>
+你可以通过 <code>tasks.mb_calibration_from_geodetic_mb</code>、
+<code>tasks.mb_calibration_from_scalar_mb</code> 或 <code>tasks.mb_calibration_from_wgms_mb</code>
+来提供自己的校准数据；默认的大地测量物质平衡（geodetic mass balance）时期由
+<code>cfg.PARAMS['geodetic_mb_period']</code> 控制。
+详见<a href="ch08.html">第8章（物质平衡模型）</a>。
+</div>
+
+<!-- ================================================================== -->
+<h2>教程五：冰厚反演</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>基于质量守恒的冰厚反演</h3>
+<p><span class="tag tag-intermediate">中级</span> | 预计时间：35分钟</p>
+</div>
+
+<h3>5.1 运行反演</h3>
+
+<div class="code-note"><strong>可直接运行：</strong>从预处理级别（prepro level）3开始，通常已经包含气候处理和物质平衡校准。反演结果主要写入<code>inversion_output.pkl</code>，后续流线模型会用它初始化冰床和冰厚。</div>
+
+<pre><code>import oggm
+from oggm import cfg, workflow
+from oggm.core import inversion
+
+cfg.initialize()
+cfg.PATHS['working_dir'] = '/tmp/oggm_tutorial_inversion'
+
+# Start from a preprocessed glacier with climate data
+gdirs = workflow.init_glacier_directories(
+    ['RGI60-11.00897'],
+    from_prepro_level=3,  # needs climate data
+    prepro_border=10
+)
+
+# Run the inversion for each glacier
+workflow.execute_entity_task(inversion.mass_conservation_inversion, gdirs)
+print("Inversion complete!")
+
+# Inspect the inversion output
+gdir = gdirs[0]
+inv_output = gdir.read_pickle('inversion_output')
+print("\nInversion output keys:", list(inv_output.keys()))
+print(f"Inverted volume: {inv_output['volume']*1e-9:.4f} km³")
+print(f"Mean thickness: {inv_output['volume']/gdir.rgi_area_m2:.1f} m")</code></pre>
+
+<h3>5.2 理解反演参数</h3>
+
+<pre><code># Key parameters affecting inversion results:
+print("Inversion parameters:")
+print(f"  Glen A:     {cfg.PARAMS['glen_a']:.2e} s⁻¹ Pa⁻³")
+print(f"  Glen n:     {cfg.PARAMS['glen_n']}")
+print(f"  Sliding fs: {cfg.PARAMS['fs']}")
+print(f"  Inversion glen_a: {cfg.PARAMS['inversion_glen_a']:.2e}")
+print(f"  Inversion fs:     {cfg.PARAMS['inversion_fs']}")
+print(f"  mixed_min_shape:  {cfg.PARAMS['mixed_min_shape']}")
+
+# The inversion solves for ice thickness H such that:
+#   flux(H) = integrated_apparent_mass_balance
+# where flux = u_bar * H * w and u_bar follows the SIA
+# with deformation + sliding contributions.</code></pre>
+
+<h3>5.3 可视化反演冰厚</h3>
+
+<pre><code>import matplotlib.pyplot as plt
+import numpy as np
+
+# Plot the thickness profile along each flowline
+fls = gdir.read_pickle('inversion_input')
+inv = gdir.read_pickle('inversion_output')
+
+fig, axes = plt.subplots(len(fls), 1, figsize=(12, 4 * len(fls)),
+                          squeeze=False)
+for i, fl in enumerate(fls):
+    ax = axes[i, 0]
+    x = fl.dis_on_line / 1000  # km
+    thick = inv['thickness'][i]
+    # Surface = bed + thickness
+    bed = fl.bed_h
+    surface = fl.surface_h
+    computed_surface = bed + thick
+
+    ax.fill_between(x, bed, surface, alpha=0.3, color='blue',
+                     label='Measured surface')
+    ax.fill_between(x, bed, computed_surface, alpha=0.5, color='red',
+                     label='Inverted thickness')
+    ax.plot(x, bed, 'k-', linewidth=1.5, label='Bed')
+    ax.set_xlabel('Distance along flowline (km)')
+    ax.set_ylabel('Elevation (m a.s.l.)')
+    ax.set_title(f'Flowline {i}')
+    ax.legend(loc='lower left')
+    ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()</code></pre>
+
+<h3>5.4 过滤反演输出</h3>
+
+<pre><code># The raw inversion can have noise. Apply filtering:
+inversion.filter_inversion_output(gdir)
+
+# Re-read and compare
+inv_filtered = gdir.read_pickle('inversion_output')
+print(f"Volume before filter: {inv['volume']*1e-9:.4f} km³")
+print(f"Volume after filter:  {inv_filtered['volume']*1e-9:.4f} km³")
+
+# Sensitivity test: vary inversion parameters
+import copy
+original_glen_a = cfg.PARAMS['inversion_glen_a']
+
+results = {}
+for factor in [0.5, 1.0, 2.0]:
+    cfg.PARAMS['inversion_glen_a'] = original_glen_a * factor
+    # In a real sensitivity experiment, reset or overwrite the inversion
+    # output before re-running mass_conservation_inversion.
+    vol = inv_filtered['volume'] * 1e-9  # placeholder
+    results[factor] = vol
+    print(f"  glen_a factor {factor}: volume = {vol:.4f} km³")
+
+cfg.PARAMS['inversion_glen_a'] = original_glen_a  # restore</code></pre>
+
+<div class="callout warning">
+<span class="callout-title">重要：反演不确定性</span>
+质量守恒反演依赖表观物质平衡（apparent mass balance）：沿流线积分后的通量需要与当前几何相容。对于强烈非平衡、跃动或几何资料误差很大的冰川，表观物质平衡（apparent mass balance）和反演厚度都会更不确定。
+默认反演使用表观物质平衡（apparent mass balance）来部分解决这一问题，但用户应注意反演体积存在10-30%的不确定性。
+误差来源的完整分析详见<a href="ch09.html">第9章（冰厚反演）</a>。
+</div>
+
+<!-- ================================================================== -->
+<h2>教程六：冰川演化</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>运行历史和未来预测</h3>
+<p><span class="tag tag-intermediate">中级</span> | 预计时间：50分钟</p>
+</div>
+
+<h3>6.1 运行历史模拟</h3>
+
+<pre><code>import oggm
+from oggm import cfg, workflow
+from oggm.core import flowline, massbalance
+
+cfg.initialize()
+cfg.PATHS['working_dir'] = '/tmp/oggm_tutorial_evolution'
+
+# Get a fully preprocessed glacier (prepro_level >= 3)
+gdirs = workflow.init_glacier_directories(
+    ['RGI60-11.00897'],
+    from_prepro_level=3,
+    prepro_border=10
+)
+
+gdir = gdirs[0]
+
+# Create a mass balance model (historical climate)
+mb_model = massbalance.PastMassBalance(gdir)
+
+# Initialize the flowline model with the inverted bed
+fls = gdir.read_pickle('model_flowlines')
+model = flowline.FluxBasedModel(
+    flowlines=fls,
+    mb_model=mb_model,
+    y0=2003,           # start year (RGI date)
+    glen_a=cfg.PARAMS['glen_a'],
+    fs=cfg.PARAMS['fs'],
+)
+
+# Run from 2003 to 2020
+print("Running historical simulation (2003-2020)...")
+model.run_until(2020)
+
+# Inspect results
+diag = model.get_diagnostics()
+print(f"\nFinal year diagnostics ({model.yr:.0f}):")
+print(f"  Volume:        {model.volume_km3:.4f} km³")
+print(f"  Area:          {model.area_km2:.2f} km²")
+print(f"  Length:        {model.length_m:.0f} m")
+print(f"  ELA:           {diag.get('ela', 'N/A')}")
+print(f"  Spec. MB:      {model.get_specific_mb():.2f} mm w.e. yr⁻¹")</code></pre>
+
+<h3>6.2 存储模型诊断数据</h3>
+
+<pre><code># Run and store diagnostics at each year
+from oggm.core.flowline import flowline_model_run
+
+# Re-initialize
+model = flowline.FluxBasedModel(
+    flowlines=fls,
+    mb_model=mb_model,
+    y0=2003,
+    glen_a=cfg.PARAMS['glen_a'],
+    fs=cfg.PARAMS['fs'],
+)
+
+# Run with diagnostics
+diag_path = gdir.get_filepath('model_diagnostics')
+flowline_model_run(
+    gdir, model,
+    ys=2003, ye=2020,
+    store_diagnostics=True,
+    output_filesuffix='_historical'
+)
+
+# Read the diagnostics
+import xarray as xr
+with xr.open_dataset(
+    gdir.get_filepath('model_diagnostics',
+                      filesuffix='_historical')
+) as ds_diag:
+    print(f"Diagnostic variables: {list(ds_diag.data_vars)}")
+    print(f"Time steps: {len(ds_diag.time)}")
+
+    # Plot volume evolution
+    import matplotlib.pyplot as plt
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(ds_diag.time, ds_diag.volume_m3 * 1e-9)
+    ax1.set_xlabel('Year')
+    ax1.set_ylabel('Volume (km³)')
+    ax1.set_title('Volume Evolution')
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(ds_diag.time, ds_diag.area_m2 * 1e-6)
+    ax2.set_xlabel('Year')
+    ax2.set_ylabel('Area (km²)')
+    ax2.set_title('Area Evolution')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()</code></pre>
+
+<h3>6.3 使用GCM数据进行未来预测</h3>
+
+<div class="code-note"><strong>概念示意：</strong>真实GCM预测需要先准备或下载GCM/ISIMIP气候文件，并用<code>process_gcm_data</code>或官方预处理流程生成对应的气候强迫。下面代码只说明delta方法在OGGM中的位置，不能替代完整情景数据准备。</div>
+
+<pre><code>from oggm.core import climate
+
+# Compute the climate delta (GCM - historical) for a future period
+# This creates a "delta method" scenario
+climate.historical_delta_method(gdir)
+
+# Create a mass balance model for the future
+mb_future = massbalance.ConstantMassBalance(gdir)
+
+# Initialize a new model from the present-day state
+model_future = flowline.FluxBasedModel(
+    flowlines=fls,
+    mb_model=mb_future,
+    y0=2020,
+    glen_a=cfg.PARAMS['glen_a'],
+    fs=cfg.PARAMS['fs'],
+    is_tidewater=gdir.is_tidewater,
+)
+
+# Run to 2100
+print("Running future projection (2020-2100)...")
+model_future.run_until(2100)
+
+diag = model_future.get_diagnostics()
+print(f"\nProjected state at 2100:")
+print(f"  Volume:        {model_future.volume_km3:.4f} km³")
+print(f"  Area:          {model_future.area_km2:.2f} km²")
+print(f"  Length change: {model_future.length_m - gdir.rgi_length_m:.0f} m")</code></pre>
+
+<h3>6.4 理解模型诊断数据</h3>
+
+<pre><code># Full list of available diagnostics from FluxBasedModel
+print("Available diagnostics:")
+common_diags = [
+    'volume_m3', 'area_m2', 'length_m',
+    'ela_m', 'calving_m3',
+    'dmdtda_mmwea',  # specific mass balance
+]
+for d in common_diags:
+    print(f"  {d}")
+
+# Annual mass balance breakdown
+print("\nModel.get_diagnostics() return values:")
+full_diag = model_future.get_diagnostics()
+for k, v in full_diag.items():
+    if isinstance(v, (int, float)):
+        print(f"  {k}: {v:.2f}")
+    else:
+        print(f"  {k}: {type(v).__name__}")</code></pre>
+
+<div class="callout tip">
+<span class="callout-title">提示：选择求解器</span>
+OGGM支持多种流线求解器：
+<ul>
+  <li><code>SemiImplicitModel</code>——OGGM v1.6.3配置文件默认的半隐式流线求解器，具有自适应时间步长。</li>
+  <li><code>FluxBasedModel</code>——显式通量求解器，常用于多流线和崩解相关实验。</li>
+  <li><code>KarthausModel</code>——较简单的显式格式，便于理解和调试数值概念。</li>
+  <li><code>FileModel</code>——从预先计算好的NetCDF输出中读取（用于后处理）。</li>
+</ul>
+每个求解器的数学细节详见<a href="ch10.html">第10章（流线模型）</a>。
+</div>
+
+<!-- ================================================================== -->
+<h2>教程七：处理多个冰川</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>区域处理、并行执行和结果汇总</h3>
+<p><span class="tag tag-intermediate">中级</span> | 预计时间：45分钟</p>
+</div>
+
+<h3>7.1 处理区域冰川目录（GlacierDirectory）</h3>
+
+<div class="code-note"><strong>可直接运行，但建议先小规模测试：</strong>区域模拟最常见的问题不是代码语法，而是个别冰川的DEM、边界或气候数据异常。第一次运行请先选5-10条冰川，确认输出和诊断图合理后再扩大区域。</div>
+
+<pre><code>import oggm
+from oggm import cfg, workflow, tasks
+
+cfg.initialize()
+cfg.PATHS['working_dir'] = '/tmp/oggm_tutorial_regional'
+
+# Define a set of glaciers (e.g., a handful from the Alps)
+rgi_ids = [
+    'RGI60-11.00897',  # Hintereisferner
+    'RGI60-11.00778',  # Vernagtferner
+    'RGI60-11.00002',  # Pasterze
+    'RGI60-11.02692',  # Findelengletscher
+    'RGI60-11.02709',  # Gornergletscher
+]
+
+print(f"Processing {len(rgi_ids)} glaciers...")
+
+# Initialize all glacier directories
+gdirs = workflow.init_glacier_directories(
+    rgi_ids,
+    from_prepro_level=0,
+    prepro_border=10,
+    reset=True
+)
+print(f"Initialized {len(gdirs)} glacier directories")
+
+# Run preprocessing pipeline (enable parallel processing for speed)
+cfg.PARAMS['use_multiprocessing'] = True
+workflow.execute_entity_task(workflow.gis_prepro_tasks, gdirs)
+print("GIS preprocessing complete!")
+
+# Quick status check
+for gdir in gdirs:
+    print(f"  {gdir.rgi_id}: {gdir.rgi_name}, "
+          f"n_flowlines={len(gdir.read_pickle('model_flowlines'))}")</code></pre>
+
+<h3>7.2 使用execute_entity_task并行处理</h3>
+
+<pre><code>import time
+
+# Run climate processing in parallel
+print("Processing climate data (parallel)...")
+t0 = time.time()
+workflow.execute_entity_task(tasks.process_climate_data, gdirs)
+print(f"Climate processing done in {time.time() - t0:.1f}s")
+
+# Run inversion in parallel
+print("Running mass-conservation inversion (parallel)...")
+t0 = time.time()
+workflow.execute_entity_task(tasks.mass_conservation_inversion, gdirs)
+print(f"Inversion done in {time.time() - t0:.1f}s")
+
+# Monitor progress
+workflow.execute_entity_task(
+    tasks.mass_conservation_inversion, gdirs,
+    print_log=True  # print progress to stdout
+)</code></pre>
+
+<h3>7.3 汇总区域结果</h3>
+
+<pre><code>import pandas as pd
+import numpy as np
+
+# Compile results from all glacier directories
+results = []
+for gdir in gdirs:
+    try:
+        inv = gdir.read_pickle('inversion_output')
+        diag = gdir.read_json('diagnostics')
+        calib = gdir.read_json('mb_calib')
+
+        results.append({
+            'rgi_id': gdir.rgi_id,
+            'name': gdir.rgi_name,
+            'area_km2': gdir.rgi_area_km2,
+            'volume_km3': inv['volume'] * 1e-9,
+            'mean_thick_m': inv['volume'] / gdir.rgi_area_m2,
+            'n_flowlines': len(gdir.read_pickle('model_flowlines')),
+            'melt_f': calib.get('melt_f', np.nan),
+            'temp_bias': calib.get('temp_bias', np.nan),
+            'prcp_fac': calib.get('prcp_fac', np.nan),
+            'dem_source': diag.get('dem_source', 'unknown'),
+        })
+    except Exception as e:
+        print(f"Failed for {gdir.rgi_id}: {e}")
+
+df = pd.DataFrame(results)
+print("\nRegional Summary:")
+print(f"  Total glaciers:  {len(df)}")
+print(f"  Total area:      {df['area_km2'].sum():.1f} km²")
+print(f"  Total volume:    {df['volume_km3'].sum():.3f} km³")
+print(f"  Mean thickness:  {df['mean_thick_m'].mean():.1f} m")
+print(f"  Mean melt_f:    {df['melt_f'].mean():.2f}")
+print("\nPer-glacier results:")
+print(df.to_string(index=False))</code></pre>
+
+<h3>7.4 错误处理和稳健处理</h3>
+
+<pre><code># Use "continue_on_error" for robust regional processing
+cfg.PARAMS['continue_on_error'] = True
+
+# This will log errors but not crash if one glacier fails
+workflow.execute_entity_task(
+    tasks.run_from_climate_data, gdirs,
+    ys=2003, ye=2020,
+)
+
+# Check which glaciers succeeded
+for gdir in gdirs:
+    if gdir.has_file('model_diagnostics'):
+        print(f"  [OK]  {gdir.rgi_id}")
+    else:
+        print(f"  [FAIL] {gdir.rgi_id} — check log for details")
+
+# Reset the parameter
+cfg.PARAMS['continue_on_error'] = False</code></pre>
+
+<!-- ================================================================== -->
+<h2>教程八：高级专题</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>动态预热（dynamic spinup）、入海型冰川、崩解、支流合并与Delta方法</h3>
+<p><span class="tag tag-advanced">高级</span> | 预计时间：60分钟</p>
+</div>
+
+<h3>8.1 动态预热（dynamic spinup）</h3>
+
+<div class="code-note"><strong>高级连续练习：</strong>动态预热（dynamic spinup）要求冰川目录（GlacierDirectory）已经完成反演和物质平衡校准。它用于减小初始化瞬态，不保证得到唯一的平衡态；区域批处理时应检查<code>run_dynamic_spinup_success</code>和匹配误差。</div>
+
+<pre><code># Dynamic spinup searches for a temperature bias and recent-past
+# initialization that matches the glacier area or volume near the RGI date.
+from oggm.core import dynamic_spinup
+
+gdir = gdirs[0]  # use a preprocessed gdir
+
+# Run a short dynamic spinup and store the initialized model geometry
+model = dynamic_spinup.run_dynamic_spinup(
+    gdir,
+    spinup_period=20,
+    min_spinup_period=10,
+    minimise_for='area',
+    precision_percent=1,
+    output_filesuffix='_dynamic_spinup',
+)
+
+print("Running spinup...")
+# The spinup runs automatically before the main simulation
+model.run_until(2020)
+
+print(f"Post-spinup volume: {model.volume_km3:.4f} km³")
+diag = gdir.get_diagnostics()
+print(f"Spinup period: {diag['dynamic_spinup_period']} years")
+print(f"Temperature bias: {diag['temp_bias_dynamic_spinup']:.2f} °C")</code></pre>
+
+<h3>8.2 入海型冰川与崩解</h3>
+
+<div class="code-note"><strong>高级连续练习：</strong>这段依赖已有<code>gdirs</code>、<code>cfg</code>、<code>workflow</code>和<code>tasks</code>。入海型冰川结果对水位、冰床和崩解参数非常敏感，不建议在没有诊断图的情况下直接用于区域结论。</div>
+
+<pre><code>import xarray as xr
+
+# Tidewater glaciers require additional setup.
+# Start from an already prepared list of GlacierDirectory objects, e.g.
+# gdirs = workflow.init_glacier_directories(rgi_ids, from_prepro_level=3, ...)
+tw_gdirs = [g for g in gdirs if g.is_tidewater]
+if len(tw_gdirs) > 0:
+    tw_gdir = tw_gdirs[0]
+    print(f"Tidewater glacier: {tw_gdir.rgi_id} "
+          f"({tw_gdir.rgi_name})")
+    print(f"Terminus type: {tw_gdir.terminus_type}")
+
+    # Configure k-calving. OGGM v1.6.3 uses 0.6 yr^-1 by default.
+    cfg.PARAMS['use_kcalving_for_run'] = True
+    cfg.PARAMS['calving_k'] = 0.6
+
+    # Recompute calving-aware inversion diagnostics, initialize the model,
+    # and run with the standard OGGM task interface.
+    workflow.execute_entity_task(
+        tasks.find_inversion_calving_from_any_mb, [tw_gdir]
+    )
+    workflow.execute_entity_task(
+        tasks.init_present_time_glacier, [tw_gdir]
+    )
+    workflow.execute_entity_task(
+        tasks.run_from_climate_data, [tw_gdir], ys=2000, ye=2020
+    )
+
+    with xr.open_dataset(tw_gdir.get_filepath('model_diagnostics')) as ds:
+        print(float(ds.volume_m3.isel(time=-1)) / 1e9, "km3")
+        print(float(ds.length_m.isel(time=-1)), "m")</code></pre>
+
+<h3>8.3 合并支流冰川</h3>
+
+<pre><code>from oggm.core import flowline
+
+# Complex glaciers have multiple centerlines with tributaries
+# You can control how tributaries are handled:
+
+# Option 1: Independent flowlines (default)
+cfg.PARAMS['use_multiple_flowlines'] = True
+
+# Option 2: Merge tributaries into one main flowline
+cfg.PARAMS['use_multiple_flowlines'] = False
+
+# Inspect the tributary structure
+fls = gdir.read_pickle('model_flowlines')
+for i, fl in enumerate(fls):
+    info = []
+    if hasattr(fl, 'is_tributary') and fl.is_tributary:
+        info.append('tributary')
+    if hasattr(fl, 'flows_to'):
+        info.append(f'flows_to={fl.flows_to}')
+    if hasattr(fl, 'is_rectangular'):
+        info.append(f'rectangular={fl.is_rectangular}')
+    print(f"  Flowline {i}: {', '.join(info)}")</code></pre>
+
+<h3>8.4 使用Delta方法进行气候预测</h3>
+
+<pre><code># The delta method computes climate change signals from GCMs
+# and applies them as anomalies to the historical climate
+
+from oggm.core import climate
+import xarray as xr
+
+# Step 1: Compute the delta for a given GCM and scenario
+# (This is normally done during process_climate_data)
+climate.historical_delta_method(gdir)
+
+# Step 2: Inspect the delta
+delta_file = gdir.get_filepath(
+    'climate_historical',
+    filesuffix='_delta'
+)
+print(f"Delta file: {delta_file}")
+
+# Step 3: Create a future mass balance model
+from oggm.core.massbalance import ConstantMassBalance
+mb_future = ConstantMassBalance(
+    gdir, y0=2003,
+    halfsize=15,        # window half-size for climate averaging
+    filename='climate_historical',
+    input_filesuffix='_delta',
+)
+
+# The delta signal is already baked into the climate file,
+# so the ConstantMassBalance model can use it directly.
+# For GCM-driven runs, you compute deltas from raw GCM output:
+# climate.process_gcm_data(gdir, filesuffix='_GCM_output')
+</code></pre>
+
+<h3>8.5 交叉验证与敏感性分析</h3>
+
+<pre><code># Systematic parameter sensitivity test
+import copy
+from oggm.core.flowline import FluxBasedModel
+
+baseline_params = {
+    'glen_a': cfg.PARAMS['glen_a'],
+    'fs': cfg.PARAMS['fs'],
+}
+fls = gdir.read_pickle('model_flowlines')
+mb_model = massbalance.PastMassBalance(gdir)
+
+sensitivity_results = {}
+for glen_factor in [0.5, 1.0, 2.0]:
+    for fs_value in [0.0, cfg.PARAMS['fs']]:
+        # Clone flowlines to avoid in-place modification
+        import copy
+        fls_copy = copy.deepcopy(fls)
+
+        model = FluxBasedModel(
+            flowlines=fls_copy,
+            mb_model=mb_model,
+            y0=2003,
+            glen_a=baseline_params['glen_a'] * glen_factor,
+            fs=fs_value,
+        )
+        model.run_until(2020)
+        key = f"glen={glen_factor:.1f}, fs={fs_value:.0f}"
+        sensitivity_results[key] = model.volume_km3
+
+print("\nSensitivity Analysis (final volume, km³):")
+for key, vol in sensitivity_results.items():
+    print(f"  {key}: {vol:.4f}")</code></pre>
+
+<!-- ================================================================== -->
+<h2>教程九：常见错误与定位方法</h2>
+<!-- ================================================================== -->
+<div class="tutorial-header">
+<h3>从报错信息回到OGGM工作流</h3>
+<p><span class="tag tag-beginner">初级</span> | 预计时间：20分钟</p>
+</div>
+
+<table class="checklist">
+<thead><tr><th>报错或现象</th><th>通常含义</th><th>优先检查</th></tr></thead>
+<tbody>
+<tr><td><code>FileNotFoundError: climate_historical</code></td><td>尚未运行气候处理，或filesuffix不一致。</td><td>确认是否执行<code>tasks.process_climate_data</code>，并检查<code>gdir.has_file('climate_historical')</code>。</td></tr>
+<tr><td><code>mb_calib.json</code>不存在</td><td>物质平衡校准没有完成。</td><td>重新运行气候任务或<code>tasks.mb_calibration_from_geodetic_mb</code>。</td></tr>
+<tr><td>中心线很短或方向异常</td><td>DEM、RGI边界、冰川掩膜或边界像素设置不合适。</td><td>用<code>plot_domain</code>和<code>visualize_centerlines</code>检查几何，不要先调动力学参数。</td></tr>
+<tr><td>反演体积异常大/小</td><td>表观物质平衡（apparent mass balance）、Glen A、滑动、冰床形状或几何输入异常。</td><td>先查<code>inversion_input</code>和<code>inversion_output</code>，再做参数敏感性。</td></tr>
+<tr><td>正演中冰川突然爆炸或消失</td><td>初始几何、物质平衡强迫或时间步长触发数值问题。</td><td>缩短运行时段，开启诊断输出，比较<code>area_m2</code>、<code>volume_m3</code>和<code>length_m</code>。</td></tr>
+<tr><td>区域批处理中少数冰川失败</td><td>这是常见现象，通常由个别冰川几何或数据源导致。</td><td>使用<code>continue_on_error=True</code>记录失败清单，逐条检查失败任务和输入文件。</td></tr>
+</tbody>
+</table>
+
+<pre><code># Minimal diagnostic checklist for one glacier directory
+for name in ['gridded_data', 'climate_historical', 'mb_calib',
+             'inversion_output', 'model_flowlines', 'model_diagnostics']:
+    print(f"{name:25s}", gdir.has_file(name))
+
+print(gdir.rgi_id, gdir.rgi_area_km2, gdir.rgi_region)
+print(gdir.get_diagnostics())</code></pre>
+
+<div class="chapter-nav">
+  <a href="ch21.html">← 第21章 测试框架与质量保障</a>
+  <a href="appendix_a.html">附录A API参考 →</a>
+</div>
+
+<footer>
+  OGGM 源码深度解析 &mdash; 第22章 OGGM教程全集
+</footer>
+
+</body>
+</html>

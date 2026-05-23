@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第5章 GIS操作与DEM处理 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第5章 GIS操作与DEM处理</h1>
+
+<p>
+<code>gis.py</code> 是OGGM中代码量较大的单文件模块之一，约2180行代码，承担着所有冰川地理空间处理的入口职责。从原始DEM（Digital Elevation Model）的读取与平滑，到冰川掩码的栅格化（rasterization）生成，再到网格参数的选择和DEM重投影，<code>gis.py</code> 将遥感与GIS领域的基础操作封装为OGGM工作流中的标准<code>entity_task</code>。本章按数据处理链路逐步拆解这些关键函数，揭示其内部算法和参数含义。
+</p>
+
+<!-- ================================================================== -->
+<h2>5.1 模块概览与数据流</h2>
+
+<p>
+在OGGM的完整工作流中，<code>gis.py</code> 处于最前端的位置。一条冰川的处理从GIS任务开始，其整体数据流为：
+</p>
+
+<pre><code>dem.tif + outlines.shp
+    │
+    ▼
+[process_dem] ──── gridded_data.nc (topo, topo_smoothed, topo_valid_mask)
+    │
+    ▼
+[glacier_masks] ──── gridded_data.nc (glacier_mask, glacier_ext)
+    │
+    ▼
+[glacier_grid_params] ──── glacier_grid.json
+    │
+    ▼
+[gridded_attributes] ──── gridded_data.nc (slope, aspect, dis_from_border, ...)
+    │
+    ▼
+[compute_hypsometry_attributes] ──── hypsometry.csv
+    │
+    ▼
+几何（outline）导出 ──── geometries.pkl
+</code></pre>
+
+<p>
+整个流程由 <code>gis_prepro_tasks</code> 函数（约第1850行）编排，它将各步骤注册为GlobalGCModel的任务图节点，确保在正确的工作流阶段执行。
+</p>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout tip">
+  <div class="callout-title">理解GIS模块的关键</div>
+  <p>
+    <code>gis.py</code> 中的几乎所有函数都操作两种核心数据结构：<strong>glacier_grid.json</strong>（标量参数，如地图投影、网格分辨率）和 <strong>gridded_data.nc</strong>（二维栅格数组，如高程场、掩码）。理解这两类数据的读写模式是阅读本章的先决条件。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>5.2 GriddedNcdfFile 上下文管理器</h2>
+
+<p>
+在深入各处理函数之前，必须先了解 <code>GriddedNcdfFile</code>（约第682-763行），它是所有栅格数据的统一容器。这个类基于 NetCDF4 实现了一个上下文管理器，负责单个NetCDF文件中多个二维变量的读写。
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">GriddedNcdfFile</span>():
+    <span class="cmt">"""单个NetCDF文件中管理所有gridded_data变量的上下文管理器"""</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="dec">self</span>, <span class="dec">gdir</span>):
+        <span class="dec">self</span>.f = <span class="kw">None</span>
+        <span class="dec">self</span>.fid = <span class="kw">None</span>
+        <span class="dec">self</span>.gdir = gdir
+
+    <span class="kw">def</span> <span class="fn">__enter__</span>(<span class="dec">self</span>):
+        <span class="cmt"># 以 'a' 模式打开NetCDF（不存在则创建）</span>
+        <span class="dec">self</span>.fid = netCDF4.Dataset(<span class="dec">self</span>.gdir.get_filepath(<span class="str">'gridded_data'</span>), <span class="str">'a'</span>)
+        <span class="kw">return</span> <span class="dec">self</span>
+
+    <span class="kw">def</span> <span class="fn">create_dim</span>(<span class="dec">self</span>, <span class="dec">nx</span>, <span class="dec">ny</span>):  <span class="cmt">...</span>
+    <span class="kw">def</span> <span class="fn">create_var</span>(<span class="dec">self</span>, <span class="dec">name</span>, <span class="dec">data</span>): <span class="cmt">...</span>
+    <span class="kw">def</span> <span class="fn">read_var</span>(<span class="dec">self</span>, <span class="dec">name</span>, <span class="dec">**kw</span>): <span class="cmt">...</span>
+    <span class="kw">def</span> <span class="fn">__exit__</span>(<span class="dec">self</span>, ...):  <span class="cmt">...</span></code></pre>
+
+<p>
+关键设计决策：使用NetCDF而非多个独立GeoTIFF，是因为单个冰川的栅格数据维度通常不超过200x200像素，将高程、掩码、坡度、坡向等变量储存在一个文件中减少了I/O开销，并且NetCDF自带的元数据机制便于后续分析时的变量发现。
+</p>
+
+<!-- ================================================================== -->
+<h2>5.3 DEM处理工作流（process_dem）</h2>
+
+<p>
+<code>process_dem</code>（约第767-899行）是整个GIS预处理的核心函数。它接收原始DEM和冰川轮廓，生成平滑后的高程场，是整个模型的地形基础。按处理顺序可分为四个阶段。
+</p>
+
+<h3>5.3.1 第一阶段：读取GeoTIFF DEM</h3>
+
+<p>
+DEM的读取通过 <code>read_geotiff_dem</code> 函数委托给 <code>rasterio</code> 库完成。这一函数不仅读取高程数组，还同步提取地理参考元数据：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">read_geotiff_dem</span>(<span class="dec">gdir</span>):
+    <span class="cmt"># 使用rasterio读取DEM GeoTIFF</span>
+    <span class="kw">with</span> rasterio.open(dem_path) <span class="kw">as</span> ds:
+        topo = ds.read(<span class="dec">1</span>)  <span class="cmt"># 读取第一波段</span>
+        <span class="cmt"># 提取仿射变换参数 (左上角坐标 + 像素分辨率)</span>
+        <span class="dec">transform</span> = ds.transform
+    <span class="kw">return</span> topo, transform</code></pre>
+
+<p>
+<code>topo</code> 是一个二维float64数组，单位为米。当DEM中存在<code>NaN</code>或负值（表示海洋/空洞）时，后续的空洞填充算法将被触发。
+</p>
+
+<h3>5.3.2 第二阶段：空洞填充（Void Filling）</h3>
+
+<p>
+DEM空洞填充采用两级策略（约第820-845行）。首先对小于<code>cfg.PARAMS['max_thin_void']</code>（默认50像素）的小空洞使用双线性插值（<code>scipy.interpolate.griddata</code> 的 <code>linear</code> 模式）。对于更大的空洞，使用最近邻外推（<code>nearest</code> 模式）。如果空洞覆盖面积超过<code>max_void_percentage</code>（默认1.0），则整个DEM被拒绝并返回错误。
+</p>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">空洞填充的边界效应</div>
+  <p>
+    当大空洞出现在冰川区域边缘时，最近邻外推可能引入虚假地形。OGGM在填充前先计算 <code>topo_valid_mask</code>（原始有效像素掩码），存于<code>gridded_data.nc</code> 中，供后续坡度计算时排除填充区域。
+  </p>
+</div>
+
+<h3>5.3.3 第三阶段：高斯平滑</h3>
+
+<p>
+平滑是DEM处理中最关键的步骤之一，通过 <code>gaussian_blur</code> 函数（约第91-115行）实现：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">gaussian_blur</span>(<span class="dec">grid</span>, <span class="dec">sigma</span>):
+    <span class="cmt">"""使用FFT卷积进行高斯平滑"""</span>
+    <span class="cmt"># 1. 生成高斯核</span>
+    l = <span class="dec">int</span>(<span class="dec">sigma</span> * <span class="dec">4</span>)
+    x = np.arange(-l, l+<span class="dec">1</span>)
+    kern = np.exp(-(x**<span class="dec">2</span>)/(<span class="dec">2</span>*<span class="dec">sigma</span>**<span class="dec">2</span>))
+    kern /= kern.sum()
+
+    <span class="cmt"># 2. 在频域执行二维分离卷积（先x后y，或先y后x）</span>
+    <span class="kw">from</span> scipy.signal <span class="kw">import</span> fftconvolve
+    smoothed_x = fftconvolve(grid, kern[np.newaxis, :], <span class="dec">mode</span>=<span class="str">'same'</span>)
+    smoothed = fftconvolve(smoothed_x, kern[:, np.newaxis], <span class="dec">mode</span>=<span class="str">'same'</span>)
+    <span class="kw">return</span> smoothed</code></pre>
+
+<p>
+平滑窗口大小由 <code>cfg.PARAMS['smooth_window']</code> 控制。这里的 <code>sigma</code> 被设置为 <code>smooth_window / dx</code>（其中<code>dx</code>是像素分辨率），默认值为3.5格网单位。FFT卷积相比空域卷积在处理大核时性能更优。平滑后的高程场写入<code>topo_smoothed</code>变量。
+</p>
+
+<h3>5.3.4 第四阶段：裁剪与输出</h3>
+
+<p>
+可选的裁剪参数 <code>clip_dem0</code> 将低于海平面（0 m a.s.l.）的像素设为0。最终输出三个变量到 <code>gridded_data.nc</code>：<code>topo</code>（原始高程）、<code>topo_smoothed</code>（平滑高程）、<code>topo_valid_mask</code>（有效像素掩码）。
+</p>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>默认值</th><th>作用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>smooth_window</code></td><td>3.5</td><td>高斯平滑核宽度（像素单位）</td></tr>
+    <tr><td><code>topo_interp</code></td><td><code>'linear'</code></td><td>小空洞填充方法（linear/nearest/spline）</td></tr>
+    <tr><td><code>max_thin_void</code></td><td>50</td><td>"小型"空洞的最大像素数（超过则用nearest）</td></tr>
+    <tr><td><code>max_void_percentage</code></td><td>1.0</td><td>空洞面积占DEM的最大允许比例（%）</td></tr>
+    <tr><td><code>clip_dem0</code></td><td><code>False</code></td><td>是否将低于0m的像素强制设为0</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>5.4 冰川掩码计算（glacier_masks）</h2>
+
+<p>
+<code>glacier_masks</code>（约第902-1032行）将矢量形状文件（outlines.shp）中的冰川多边形转换为栅格掩码。这是连接矢量GIS数据和栅格模型的桥梁。
+</p>
+
+<h3>5.4.1 多边形到像素坐标的转换</h3>
+
+<p>
+转换分两步进行。首先 <code>_interp_polygon</code> 将冰川多边形的顶点等距插值到 <code>grid_dx</code> 的分辨率级别——这对于保持小冰川的几何精度至关重要，因为原始RGI多边形可能只有十几个顶点。然后 <code>_polygon_to_pix</code> 将地理坐标（经度/纬度或投影米）映射到格网像素索引。
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">_interp_polygon</span>(<span class="dec">poly_pix</span>, <span class="dec">dx</span>):
+    <span class="cmt">"""在规则步长下插值多边形顶点"""</span>
+    <span class="cmt"># 计算相邻顶点间距，在超过dx距离的顶点间线性插值新点</span>
+    dist = np.sqrt(np.sum(np.diff(poly_pix, <span class="dec">axis</span>=<span class="dec">0</span>)**<span class="dec">2</span>, <span class="dec">axis</span>=<span class="dec">1</span>))
+    <span class="kw">for</span> i <span class="kw">in</span> <span class="dec">range</span>(<span class="dec">len</span>(dist)):
+        <span class="kw">if</span> dist[i] > dx:
+            n_interp = <span class="dec">int</span>(dist[i] / dx)
+            <span class="cmt"># 在poly_pix[i]和poly_pix[i+1]之间线性插入n_interp个点</span>
+    ...</code></pre>
+
+<h3>5.4.2 栅格化（rasterization）与冰原岛处理</h3>
+
+<p>
+多边形栅格化（rasterization）使用 <code>skimage.draw.polygon</code> 将多边形边界内的所有像素标记为冰川。对于含有内环（holes/nunataks）的复杂多边形，OGGM通过Shapely分别提取外环和内环——外环填充冰川掩码，内环在掩码中除外（设回0）。此外，函数使用 <code>scipy.ndimage.label</code> 识别连通组件，移除面积小于最大连通区5%的孤立小斑块（ice islands，即与主体冰川掩码分离的像素团）。
+</p>
+
+<p>
+最终输出写入 <code>gridded_data.nc</code>：<code>glacier_mask</code>（二值掩码，glacier=1 else=0）和 <code>glacier_ext</code>（冰川外轮廓内的所有像素，包括nunatak）。
+</p>
+
+<h3>5.4.3 简化掩码方法（simple_glacier_masks）</h3>
+
+<p>
+<code>simple_glacier_masks</code>（约第1034-1163行）是替代方案，当不需要亚像素精度时使用 <code>rasterio.features.rasterize</code>（riomask模式）直接栅格化（rasterization）多边形，省去了坐标变换中的插值步骤，速度更快但几何精度略低。
+</p>
+
+<!-- ================================================================== -->
+<h2>5.5 网格参数选择（glacier_grid_params）</h2>
+
+<p>
+<code>glacier_grid_params</code>（约第226-302行）决定每个冰川在其地图投影中的网格分辨率（<code>dx</code>）。这是OGGM中最精妙的空间尺度自适应算法之一。
+</p>
+
+<h3>5.5.1 四种分辨率方法</h3>
+
+<table>
+  <thead>
+    <tr><th>方法</th><th>公式/逻辑</th><th>适用场景</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>linear</code></td><td>dx = d1 * sqrt(area) + d2</td><td>默认方法，小冰川细网格、大冰川粗网格</td></tr>
+    <tr><td><code>square</code></td><td>dx = sqrt(area) / 50</td><td>适用于对测高数据敏感的冰厚反演</td></tr>
+    <tr><td><code>fixed</code></td><td>dx = grid_dx_fixed（用户指定）</td><td>对区域同质网格进行批量处理</td></tr>
+    <tr><td><code>by_bin</code></td><td>按面积分箱，每箱一个固定dx</td><td>便于与其他模型进行区间比较</td></tr>
+  </tbody>
+</table>
+
+<p>
+<code>linear</code> 方法的两个系数 <code>d1</code> 和 <code>d2</code>（默认14.0和0.0）由<code>cfg.PARAMS</code>设置，其背后的物理直觉是：冰川的宽度大致与其长度的平方根成正比，因此像素数应保持恒定。参数<code>dx_scale</code> 用于全局缩放所有derived的分辨率。
+</p>
+
+<p>
+最终选定的<code>dx</code>、地图投影参数（由 <code>salem</code> 库基于冰川质心位置确定合适的UTM区或Albers等面积投影）、以及网格的<code>nx</code>和<code>ny</code>都写入<code>glacier_grid.json</code>。
+</p>
+
+<!-- ================================================================== -->
+<h2>5.6 DEM重投影（reproject_dem）</h2>
+
+<p>
+<code>reproject_dem</code>（约第351-453行）使用 <code>rasterio.warp.reproject</code> 将地理坐标系的DEM重投影到每条冰川的特定投影坐标系。重采样算法默认为双线性（<code>bilinear</code>），对于坡度等派生变量可用三次（<code>cubic</code>）。
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">reproject_dem</span>(<span class="dec">gdir</span>):
+    <span class="cmt"># 确定目标投影（UTM / Albers）和网格参数</span>
+    proj_out = gdir.grid.center_grid  <span class="cmt"># 从 glacier_grid.json 读取</span>
+
+    <span class="kw">with</span> rasterio.open(src_path) <span class="kw">as</span> src:
+        reproject(
+            <span class="dec">source</span>=src.read(<span class="dec">1</span>),
+            <span class="dec">destination</span>=dest_array,
+            <span class="dec">src_transform</span>=src.transform,
+            <span class="dec">src_crs</span>=src.crs,
+            <span class="dec">dst_transform</span>=dst_transform,
+            <span class="dec">dst_crs</span>=proj_out,
+            <span class="dec">resampling</span>=Resampling.bilinear)</code></pre>
+
+<p>
+重投影后的高程存储在GlacierDirectory的本地GeoTIFF中，并作为后续所有二维计算的底图。这一步的精度直接决定了网格属性（坡度、坡向）的可靠性。
+</p>
+
+<!-- ================================================================== -->
+<h2>5.7 网格属性计算（gridded_attributes）</h2>
+
+<p>
+<code>gridded_attributes</code>（约第1407-1523行）计算多个二维场，这些场是后续中心线搜索和冰厚反演算法的必要输入：
+</p>
+
+<table>
+  <thead>
+    <tr><th>属性</th><th>计算方法</th><th>用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>slope</code></td><td><code>np.gradient(topo_smoothed, dx)</code> 的模</td><td>冰厚反演（驱动力）、中心线搜索</td></tr>
+    <tr><td><code>aspect</code></td><td><code>np.arctan2(dy, dx)</code></td><td>海拔带分析、太阳辐射</td></tr>
+    <tr><td><code>slope_factor</code></td><td>max(tan(slope), min_slope)</td><td>反演中防止近零坡度导致的数值爆炸</td></tr>
+    <tr><td><code>dis_from_border</code></td><td><code>scipy.ndimage.distance_transform_edt</code> 取欧氏距离</td><td>中心线成本网格、按海拔分配厚度</td></tr>
+    <tr><td><code>ice_divides</code></td><td>分水岭算法在水文流向图上执行</td><td>支流划分、集水区面积计算</td></tr>
+  </tbody>
+</table>
+
+<p>
+其中 <code>slope_factor</code> 的 <code>min_slope</code> 默认值为 <code>tan(1.5°)</code>，低于此坡度的像素被提升到此阈值，避免冰厚反演中除零或产生无穷大厚度。
+</p>
+
+<!-- ================================================================== -->
+<h2>5.8 测高曲线计算（compute_hypsometry_attributes）</h2>
+
+<p>
+<code>compute_hypsometry_attributes</code>（约第1165-1274行）以50m为固定高程箱计算每个海拔段内的面积及其占冰川总面积的千分比（permil）。输出为 <code>hypsometry.csv</code>，表头包括<code>topo_bin</code>、<code>area</code>、<code>permil</code>三列。
+</p>
+
+<pre><code><span class="cmt"># 简化逻辑</span>
+bins = np.arange(<span class="dec">min_elev</span> // <span class="dec">50</span> * <span class="dec">50</span>, <span class="dec">max_elev</span> + <span class="dec">50</span>, <span class="dec">50</span>)
+<span class="kw">for</span> i <span class="kw">in</span> <span class="dec">range</span>(<span class="dec">len</span>(bins)-<span class="dec">1</span>):
+    area_in_bin = np.sum((topo >= bins[i]) & (topo < bins[i+<span class="dec">1</span>])
+                         & glacier_mask) * dx**<span class="dec">2</span>
+    hyps[i, :] = [bins[i]+<span class="dec">25</span>, area_in_bin, area_in_bin / total_area * <span class="dec">1000</span>]</code></pre>
+
+<p>
+测高曲线是物质平衡校准和面积-高度分布匹配的关键输入，在第8章的物质平衡模型中将反复引用。
+</p>
+
+<!-- ================================================================== -->
+<h2>5.9 GIS任务的完整工作流</h2>
+
+<p>
+<code>gis_prepro_tasks</code> 函数（约第1850行）将所有上述步骤编排为任务图。这允许OGGM以任意顺序构建依赖关系并并行化处理：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">gis_prepro_tasks</span>(<span class="dec">gdirs</span>):
+    task_list = [
+        task<i>process_dem,                     <span class="cmt"># 1. DEM处理</span>
+        task<i>glacier_masks,                   <span class="cmt"># 2. 冰川掩码</span>
+        task<i>glacier_grid_params,             <span class="cmt"># 3. 网格参数</span>
+        task<i>glacier_mu_candidates,            <span class="cmt"># 4. 物质平衡参考期</span>
+        task<i>compute_centerlines,             <span class="cmt"># 5. → 第6章</span>
+        ...
+    ]
+</code></pre>
+
+<!-- ================================================================== -->
+<h2>5.10 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>所属函数</th><th>默认值</th><th>描述</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>border</code></td><td>process_dem</td><td>40</td><td>冰川周围缓冲区的像素数</td></tr>
+    <tr><td><code>grid_dx_method</code></td><td>glacier_grid_params</td><td><code>'linear'</code></td><td>网格分辨率选择方法</td></tr>
+    <tr><td><code>d1</code></td><td>glacier_grid_params</td><td>14.0</td><td>linear方法的缩放系数</td></tr>
+    <tr><td><code>d2</code></td><td>glacier_grid_params</td><td>0.0</td><td>linear方法的偏移量</td></tr>
+    <tr><td><code>dx_scale</code></td><td>glacier_grid_params</td><td>1.0</td><td>全局网格分辨率缩放</td></tr>
+    <tr><td><code>topo_interp</code></td><td>process_dem</td><td><code>'linear'</code></td><td>空洞填充插值方法</td></tr>
+    <tr><td><code>smooth_window</code></td><td>process_dem</td><td>3.5</td><td>高斯平滑窗口（像素）</td></tr>
+    <tr><td><code>clip_dem0</code></td><td>process_dem</td><td><code>False</code></td><td>低于海平面裁剪</td></tr>
+    <tr><td><code>min_slope</code></td><td>gridded_attributes</td><td><code>tan(1.5°)</code></td><td>最小坡度因子阈值</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>5.11 总结</h2>
+
+<p>
+<code>gis.py</code> 是OGGM的基础模块——每一寸冰川模型的构建都始于这里的DEM处理。从空洞填充到高斯平滑，从多边形栅格化（rasterization）到网格分辨率自适应选择，这些看似基础的操作中蕴含着丰富的冰川学工程权衡：如何在精度和计算效率之间取得平衡，如何处理真实DEM中的各种瑕疵，如何让同一套代码适用于从0.1km<sup>2</sup>到10000km<sup>2</sup>的冰川。掌握GIS模块的细节，对理解后续所有模型输出的物理含义至关重要。
+</p>
+
+<p>
+下一章将进入OGGM最具原创性的算法领域——冰川中心线提取和几何参数化。在那里，将看到本章生成的地形属性（坡度、坡向、边界距离）如何被转化为中心线优化算法的成本函数。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch04.html">第4章：GlacierDirectory 数据中枢</a></span>
+  <span class="next"><a href="ch06.html">第6章：冰川中心线与几何参数化</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源模型技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

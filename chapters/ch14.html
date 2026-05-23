@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第14章 二维SIA模块 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第14章 二维SIA模块</h1>
+
+<p>
+<code>sia2d.py</code> 约449行，实现了OGGM的二维SIA网格模型——与第10章讨论的一维流线模型不同，这个模块在规则网格上直接求解二维SIA方程。它适用于理想化实验、小冰川的详细模拟、以及1D流线与2D网格模型之间的方法对比。代码量虽小，但包含了从上游加权差分到CFL时间步进的完整二维冰流求解器。
+</p>
+
+<div class="callout warning">
+  <div class="callout-title">先明确定位</div>
+  <p>OGGM的常规区域和全球模拟主要依赖一维流线工作流。二维SIA模块更适合理想化实验、教学和数值方法比较；除非已经验证输入、边界条件和适用性，不建议把它作为常规区域研究的默认工具。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>14.1 概述与设计理念</h2>
+
+<p>
+1D流线模型（<code>FlowlineModel</code>及其子类）通过将冰川简化为沿中心线的带状几何来降低计算维度。这种方法在计算效率和物理精度之间取得了平衡，但以牺牲二维细节为代价——例如横谷宽度变化、侧向冰流效应、和不规则流域几何。2D SIA模块填补了这一空白，提供了在<strong>完整的二维地形网格</strong>上直接求解SIA方程的能力。
+</p>
+
+<p>
+关键区别：
+</p>
+
+<table>
+  <thead>
+    <tr><th>特性</th><th>1D流线模型（第10章）</th><th>2D SIA模块（本章）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>几何表示</td><td>沿中心线的一维带状 + 冰床横截面形状（bed cross-section geometry）参数</td><td>二维规则网格（dx x dy）</td></tr>
+    <tr><td>侧向约束</td><td>通过宽度或梯形参数隐式表示</td><td>通过实际地形显式表示</td></tr>
+    <tr><td>支流系统（tributary system）</td><td>支持——支流汇入主流线</td><td>不支持——所有通量在网格中直接计算</td></tr>
+    <tr><td>崩解参数化</td><td>全功能k-崩解定律</td><td>未实现（简化设计）</td></tr>
+    <tr><td>计算成本</td><td>O(nx) per step</td><td>O(nx*ny) per step</td></tr>
+    <tr><td>适用场景</td><td>生产批量模拟</td><td>理想化实验、小冰川、方法研究</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>14.2 冰边界滤波：filter_ice_border（第10行）</h2>
+
+<p>
+在2D网格中，冰川边缘的处理是一个微妙的问题。冰覆盖区域与无冰区域之间的边界处，SIA梯度可能产生非物理的冰流。OGGM通过一个简单的域边界滤波来处理：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">filter_ice_border</span>(<span class="dec">ice_thick</span>):
+    <span class="cmt"># 将域边缘的一个像素宽的边界上的冰厚置为零</span>
+    ice_thick[<span class="dec">0</span>, :] = <span class="dec">0</span>
+    ice_thick[<span class="dec">-1</span>, :] = <span class="dec">0</span>
+    ice_thick[:, <span class="dec">0</span>] = <span class="dec">0</span>
+    ice_thick[:, <span class="dec">-1</span>] = <span class="dec">0</span>
+    <span class="kw">return</span> ice_thick</code></pre>
+
+<p>
+这个边界条件在物理上等价于"冰川不能扩展到计算域之外"——在计算域边缘，冰被强制为零，起到了吸收边界的作用。默认的<code>ice_thick_filter</code>就是<code>filter_ice_border</code>，但用户可以替换为自定义的滤波器（例如更复杂的缓冲带或渐变过滤）。
+</p>
+
+<span class="tag tag-intermediate">中级</span>
+<div class="callout tip">
+  <div class="callout-title">为什么不使用更复杂的边界条件？</div>
+  <p>
+    完整的SIA模拟需要处理流动边界（flux boundary）——本质上是一个具有移动边界的自由边界问题。但在1D流线模型中通过跟踪每个格点的冰/无冰状态来处理（通过厚度截断），2D模块采用更简单的域级零厚度边界。对于从小冰期以来一直退缩的冰川，计算域可以简单地设置为比当前冰川范围大一些，确保在整个模拟期间冰川始终在域内。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>14.3 Model2D基类（第19行）</h2>
+
+<h3>14.3.1 构造函数</h3>
+
+<pre><code><span class="kw">class</span> <span class="fn">Model2D</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="dec">self</span>, <span class="dec">bed_topo</span>, <span class="dec">init_ice_thick</span>, <span class="dec">dx</span>=<span class="kw">None</span>, <span class="dec">dy</span>=<span class="kw">None</span>,
+                 <span class="dec">mb_model</span>=<span class="kw">None</span>, <span class="dec">glen_a</span>=<span class="kw">None</span>, <span class="dec">ice_thick_filter</span>=<span class="kw">None</span>):
+
+        <span class="cmt"># 2D 地形网格</span>
+        <span class="dec">self</span>.bed_topo = bed_topo          <span class="cmt"># shape (ny, nx) — 冰床高程 (m)</span>
+        <span class="dec">self</span>.init_ice_thick = init_ice_thick <span class="cmt"># shape (ny, nx) — 初始冰厚 (m)</span>
+        <span class="dec">self</span>.dx = dx <span class="kw">or</span> <span class="dec">100</span>             <span class="cmt"># 格点间距 x 方向 (m)</span>
+        <span class="dec">self</span>.dy = dy <span class="kw">or</span> dx              <span class="cmt"># 格点间距 y 方向 (m)，默认与dx相同</span>
+
+        <span class="cmt"># MB模型、Glen参数、高程反馈（同FlowlineModel）</span>
+        <span class="dec">self</span>.mb_model = mb_model
+        <span class="dec">self</span>.glen_a = glen_a <span class="kw">or</span> cfg.PARAMS[<span class="str">'glen_a'</span>]
+        <span class="dec">self</span>.mb_elev_feedback = <span class="str">'annual'</span>
+
+        <span class="cmt"># 冰厚滤波器（默认：filter_ice_border）</span>
+        <span class="dec">self</span>.ice_thick_filter = ice_thick_filter <span class="kw">or</span> filter_ice_border</code></pre>
+
+<h3>14.3.2 核心属性</h3>
+
+<table>
+  <thead>
+    <tr><th>属性</th><th>类型</th><th>描述</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>yr</code></td><td>float</td><td>当前模型年份</td></tr>
+    <tr><td><code>area_m2</code></td><td>float</td><td>冰川面积 (m<sup>2</sup>) = sum(ice_thick > 0) * dx * dy</td></tr>
+    <tr><td><code>volume_m3</code></td><td>float</td><td>冰川体积 (m<sup>3</sup>) = sum(ice_thick) * dx * dy</td></tr>
+    <tr><td><code>surface_h</code></td><td>2D array</td><td>冰表面高程 = bed_topo + ice_thick（仅在有冰处）</td></tr>
+    <tr><td><code>area_km2</code></td><td>float</td><td>冰川面积 (km<sup>2</sup>)</td></tr>
+    <tr><td><code>volume_km3</code></td><td>float</td><td>冰川体积 (km<sup>3</sup>)</td></tr>
+  </tbody>
+</table>
+
+<h3>14.3.3 MB缓存与时间步进</h3>
+
+<p>
+<code>Model2D</code> 共享与<code>FlowlineModel</code>相同的MB缓存策略和<code>run_until</code>/<code>run_until_equilibrium</code>/<code>run_until_and_store</code>接口。这种接口一致性使得在1D和2D模型之间切换时上层调用代码无需改动。
+</p>
+
+<!-- ================================================================== -->
+<h2>14.4 Upstream2D模型（第247行）</h2>
+
+<h3>14.4.1 上游加权差分格式</h3>
+
+<p>
+<code>Upstream2D</code> 是OGGM中实际的2D SIA求解器。其名称源于使用的<strong>上游加权</strong>差分——在计算扩散系数时，对冰厚的插值偏向于上游方向（较高表面的方向）：
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">Upstream2D</span>(<span class="fn">Model2D</span>):
+    <span class="cmt"># gamma = 2 * A * (rho * g)^n / (n + 2)    （第299行）</span>
+    <span class="cmt"># 这是预计算的SIA常数</span>
+
+    <span class="cmt"># CFL = 0.124 （比Hindmarsh理论略大）</span>
+    <span class="cmt"># 理论最大值：1 / (2*(n+1)) = 1/8 = 0.125</span>
+    <span class="cmt"># OGGM使用 0.124 —— 略低于理论极限以确保稳定性</span>
+
+    <span class="cmt"># max_dt = 31 天  （避免过于粗大的月度时间步）</span></code></pre>
+
+<p>
+为什么CFL取0.124？对于二维非线性扩散方程，理论分析（Hindmarsh 2001）给出了稳定性极限<code>1/(2*(n+1))</code>。对于n=3，这是<code>1/8 = 0.125</code>。OGGM选择了<code>0.124</code>（略低于0.125），为数值舍入误差和边界效应留出了安全余地。
+</p>
+
+<h3>14.4.2 numpy ix_ 索引技巧</h3>
+
+<p>
+为了高效地执行交错网格操作，Upstream2D使用<code>numpy.ix_</code>来避免显式的Python循环：
+</p>
+
+<pre><code><span class="cmt"># 使用 numpy.ix_ 创建开放网格索引</span>
+<span class="cmt"># 这允许向量化切片操作，避免效率低下的 Python for 循环</span>
+iy = np.arange(<span class="dec">0</span>, ny)
+ix = np.arange(<span class="dec">0</span>, nx)
+iy_dn, ix_dn = np.ix_(iy[<span class="dec">1</span>:<span class="dec">-1</span>], ix[<span class="dec">1</span>:<span class="dec">-1</span>])
+
+<span class="cmt"># 这使得可以对内部域一次性进行向量化差分运算</span>
+<span class="cmt"># 而非逐行逐列循环</span></code></pre>
+
+<!-- ================================================================== -->
+<h2>14.5 diffusion_upstream_2d：核心计算（第332行）</h2>
+
+<p>
+这是<code>sia2d.py</code>中最重要的函数——实现了二维SIA扩散-对流方程的完整空间离散：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">diffusion_upstream_2d</span>(<span class="dec">H</span>, <span class="dec">bed</span>, <span class="dec">dx</span>, <span class="dec">dy</span>, <span class="dec">gamma</span>):
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># 步骤1：上游加权冰厚</span>
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># H_centered = 0.5 * (H[i+1] + H[i])    （中心平均）</span>
+    <span class="cmt"># H_upstream = H[i+1] if S[i+1] > S[i] else H[i]  （上游选择）</span>
+    H_up = upstream_weighted(H, bed, direction)
+
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># 步骤2：表面梯度范数</span>
+    <span class="cmt"># ============================================================</span>
+    dsdx = (S[i+<span class="dec">1</span>, j] - S[i, j]) / dx       <span class="cmt"># x方向梯度（交错面）</span>
+    dsdy_avg = (S[i, j+<span class="dec">1</span>] - S[i, j-<span class="dec">1</span>]) / (<span class="dec">2</span>*dy)  <span class="cmt"># y方向均值（非交错）</span>
+
+    <span class="cmt"># 梯度范数（用于计算扩散率中的非线性因子）</span>
+    grad_S_norm = sqrt(dsdx^<span class="dec">2</span> + dsdy_avg^<span class="dec">2</span>)^((<span class="dec">n</span><span class="dec">-1</span>)/<span class="dec">2</span>)
+
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># 步骤3：扩散系数</span>
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># D = gamma * H^(n+1) * H_upstream * grad_S_norm</span>
+    <span class="cmt"># 注意这里使用了上游加权的 H_upstream（而非 H^(n+2)）</span>
+    <span class="cmt"># 当 n=3: D = gamma * H^4 * H_upstream * (grad_S)^(2)</span>
+
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># 步骤4：通量散度</span>
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># div_x = (D_up*ds_up - D_dn*ds_dn) / dx^2</span>
+    <span class="cmt"># div_y = (D_left*ds_left - D_right*ds_right) / dy^2</span>
+    div_q = div_x + div_y
+
+    <span class="cmt"># ============================================================</span>
+    <span class="cmt"># 步骤5：CFL时间步长</span>
+    <span class="cmt"># ============================================================</span>
+    dt = cfl * min(dx^<span class="dec">2</span>, dy^<span class="dec">2</span>) / max(D)
+
+    <span class="kw">return</span> div_q, dt</code></pre>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout expert">
+  <div class="callout-title">上游加权 vs 中心加权的物理含义</div>
+  <p>
+    上游加权（在较高表面方向上取冰厚）的物理基础是：冰流方向是<strong>向下梯度</strong>的，来自上游（较高表面）的冰通量携带了上游的厚度信号。在陡峭地形或厚度剧烈变化的位置，中心平均会引入来自"错误方向"的虚假厚度信息——例如下游无冰区的零厚度被平均进来，低估了实际流过来的冰量。上游加权避免了这个问题，保证了扩散系数的物理一致性。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>14.6 Step方法（第435行）</h2>
+
+<p>
+<code>Upstream2D</code>的步进方法是一个简单的向前欧拉更新：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">step</span>(<span class="dec">self</span>, <span class="dec">dt</span>):
+    <span class="cmt"># 1. 获取当前MB（取决于高程反馈模式）</span>
+    mb = <span class="dec">self</span>.get_mb(<span class="dec">self</span>.surface_h, <span class="dec">self</span>.yr)
+
+    <span class="cmt"># 2. 计算通量散度和CFL时间步长</span>
+    div_q, dt_cfl = diffusion_upstream_2d(
+        <span class="dec">self</span>.ice_thick, <span class="dec">self</span>.bed_topo,
+        <span class="dec">self</span>.dx, <span class="dec">self</span>.dy, <span class="dec">self</span>.gamma)
+
+    <span class="cmt"># 3. 使用实际时间步长（用户指定的 dt 或 CFL 限制的 dt_cfl，取较小者）</span>
+    dt_actual = min(dt, dt_cfl)
+
+    <span class="cmt"># 4. 向前欧拉更新：dH/dt = MB + div_q</span>
+    new_surface_h = <span class="dec">self</span>.surface_h + (mb + div_q) * dt_actual
+
+    <span class="cmt"># 5. 从表面高程和冰床高程反算冰厚</span>
+    new_ice_thick = new_surface_h - <span class="dec">self</span>.bed_topo
+
+    <span class="cmt"># 6. 截断：冰厚不能为负</span>
+    new_ice_thick = np.clip(new_ice_thick, <span class="dec">0</span>, <span class="kw">None</span>)
+
+    <span class="cmt"># 7. 应用冰厚滤波器（默认：零边界条件）</span>
+    <span class="dec">self</span>.ice_thick = <span class="dec">self</span>.ice_thick_filter(new_ice_thick)</code></pre>
+
+<p>
+与1D FluxBasedModel的两步法（先算通量、再更新厚度）相比，2D的步进法将所有操作合并在一个函数中——通量散度和厚度更新同时完成。这是因为2D的网格结构使得交错网格的存访模式更简单：在每个时间步中，所有2D数组一次性计算，无需在交错面和中心之间维护多个网格表示。
+</p>
+
+<!-- ================================================================== -->
+<h2>14.7 与1D流线模型的差异总结</h2>
+
+<h3>14.7.1 几何表示</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>1D流线</th><th>2D SIA</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>侧向约束</td><td>冰床横截面形状（bed cross-section geometry）参数（f_d, trapezoid_lambdas）隐式</td><td>实际二维冰床横截面（bed cross-section）地形显式</td></tr>
+    <tr><td>冰厚分布</td><td>沿中心线一维变化</td><td>在二维平面内自由变化</td></tr>
+    <tr><td>宽度变化</td><td>预定义的宽度函数 w(x)</td><td>由冰厚和地形共同决定（自然涌现）</td></tr>
+    <tr><td>几何假设</td><td>冰床横截面形状（bed cross-section geometry）在各位置独立假设</td><td>使用完整的DEM冰床横截面（bed cross-section）</td></tr>
+  </tbody>
+</table>
+
+<h3>14.7.2 数值方案</h3>
+
+<table>
+  <thead>
+    <tr><th>特性</th><th>1D FluxBased</th><th>1D SemiImplicit</th><th>2D Upstream2D</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>离散化</td><td>交错通量（面上）</td><td>中心扩散（点内）</td><td>交错扩散（面上）</td></tr>
+    <tr><td>CFL限制</td><td>u*dt/dx &lt; 0.02</td><td>D*dt/dx^2 &lt; 0.5</td><td>D*dt/dx^2 &lt; 0.124</td></tr>
+    <tr><td>矩阵求解</td><td>否（显式）</td><td>是（三对角）</td><td>否（显式）</td></tr>
+    <tr><td>支流支持</td><td>是</td><td>否</td><td>不适用（2D网格无支流概念）</td></tr>
+    <tr><td>崩解支持</td><td>是（k-定律）</td><td>是（有限制）</td><td>否</td></tr>
+  </tbody>
+</table>
+
+<h3>14.7.3 适用性考量</h3>
+
+<p>
+<strong>何时使用2D模型：</strong>
+</p>
+<ul>
+  <li>理想化实验——如在规则沟谷或人工地形上测试SIA的物理行为。</li>
+  <li>小冰川（&lt; 5 km<sup>2</sup>）——计算成本可控，且1D的冰床横截面形状（bed cross-section geometry）假设对小冰川不太适用。</li>
+  <li>方法研究——比较1D和2D表示对同一冰川的影响。</li>
+  <li>教学用途——2D SIA方程的实现比1D更直观（直接对应数学公式）。</li>
+</ul>
+
+<p>
+<strong>何时使用1D模型：</strong>
+</p>
+<ul>
+  <li>生产批量模拟——数万条冰川的模拟在计算上仅在1D表示下可行。</li>
+  <li>有支流系统（tributary system）的冰川——2D模块不支持支流合并。</li>
+  <li>需要崩解功能——入海型冰川需要崩解参数化。</li>
+  <li>大规模空间分析——1D模型的输出更易于汇总和统计。</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>14.8 gis.py集成</h2>
+
+<p>
+2D SIA模块与<code>gis.py</code>中的GIS工具配合使用。典型的使用流程为：
+</p>
+
+<pre><code><span class="cmt"># 1. 从GIS数据准备二维网格</span>
+<span class="kw">from</span> oggm <span class="kw">import</span> gis
+gdir = gis.define_glacier_region(rgi_id, ...)
+
+<span class="cmt"># 2. 提取DEM和冰川掩码</span>
+dem = gdir.get_dem()              <span class="cmt"># 二维冰床高程网格</span>
+mask = gdir.get_glacier_mask()    <span class="cmt"># 冰川覆盖标记</span>
+
+<span class="cmt"># 3. 初始化冰厚（可选：使用简单常数或反演结果插值）</span>
+init_ice_thick = np.where(mask, <span class="dec">50</span>, <span class="dec">0</span>)  <span class="cmt"># 50 m常数厚度</span>
+
+<span class="cmt"># 4. 创建2D模型并运行</span>
+<span class="kw">from</span> oggm.core <span class="kw">import</span> sia2d
+model = sia2d.Upstream2D(dem, init_ice_thick, dx=<span class="dec">50</span>,
+                          mb_model=mb_model)
+model.run_until_equilibrium()</code></pre>
+
+<!-- ================================================================== -->
+<h2>14.9 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>默认值</th><th>位置</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>glen_a</code></td><td>2.4e-24</td><td>cfg.PARAMS</td><td>Glen流动律参数</td></tr>
+    <tr><td><code>cfl</code></td><td>0.124</td><td>Upstream2D硬编码</td><td>CFL数（略低于理论极限0.125）</td></tr>
+    <tr><td><code>max_dt</code></td><td>31天</td><td>Upstream2D硬编码</td><td>最大单步时间步长</td></tr>
+    <tr><td><code>gamma</code></td><td>2*A*(rho*g)^n/(n+2)</td><td>第299行计算</td><td>SIA预计算常数</td></tr>
+    <tr><td><code>mb_elev_feedback</code></td><td>'annual'</td><td>Model2D默认</td><td>MB高程反馈频率</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>14.10 总结</h2>
+
+<p>
+<code>sia2d.py</code> 在紧凑的449行中实现了一个完整的二维SIA冰流求解器，为OGGM的1D流线表示提供了补充方案。上游加权差分、numpy ix_向量化、和略低于理论极限的CFL数共同确保了数值的稳定性和效率。虽然没有支流系统（tributary system）和崩解参数化，但其简化的结构和与Model2D/FlowlineModel一致的接口使得方法对比和教学实验可以无缝进行。
+</p>
+
+<p>
+对于大多数批量生产模拟，1D流线模型（第10章）仍然是最佳选择，但2D模块为研究者提供了一个宝贵的"基准真相"——可以在少量冰川上运行以验证1D模型的适用性和假设限制。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch13.html">第13章：动态Spinup与模型初始化</a></span>
+  <span class="next"><a href="ch15.html">第15章：工作流引擎</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

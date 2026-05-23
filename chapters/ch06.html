@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第6章 冰川中心线与几何参数化 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第6章 冰川中心线与几何参数化</h1>
+
+<p>
+<code>centerlines.py</code> 约2454行，是OGGM中算法密度最高的模块。它的任务是将一个二维冰川掩码（第5章的产物）转化为一组合适的流线（flowlines）——每条流线都携带几何属性（宽度、面积-海拔分布），并组织为有向无环图（DAG）来模拟支流汇入主干的拓扑关系。本章沿着数据转换的完整链路，深入Kienholz et al. (2014) 最短路径算法的每个细节。
+</p>
+
+<!-- ================================================================== -->
+<h2>6.1 Centerline类：几何与拓扑的容器</h2>
+
+<p>
+<code>Centerline</code> 类（约第69行）封装了一条流线的所有信息。流线在代码中表示为沿中心线的等距坐标点序列：
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">Centerline</span>():
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="dec">self</span>, <span class="dec">line</span>, <span class="dec">dx</span>=<span class="kw">None</span>, <span class="dec">surface_h</span>=<span class="kw">None</span>):
+        <span class="dec">self</span>.line = line       <span class="cmt"># shapely LineString: N个等距点</span>
+        <span class="dec">self</span>.dis_on_line = ... <span class="cmt"># 距终点的沿程距离 [m]</span>
+        <span class="dec">self</span>.nx = <span class="dec">len</span>(line.coords)
+        <span class="dec">self</span>.order = ...       <span class="cmt"># Strahler-like序列号</span>
+        <span class="dec">self</span>.flows_to = ...    <span class="cmt"># 下游汇入的另一条Centerline对象</span>
+        <span class="dec">self</span>.inflows = []      <span class="cmt"># 汇入本线的上游Centerline对象列表</span></code></pre>
+
+<p>
+关键设计是 <code>flows_to</code> 和 <code>inflows</code> 构建的有向无环图（DAG）。通过<code>inflows</code>可以遍历所有上游支流，通过<code>line_order()</code>可以建立Strahler排水次序式的拓扑排序——从末梢支流开始在依次向上游推进到主干。
+</p>
+
+<span class="tag tag-beginner">入门</span>
+<div class="callout tip">
+  <div class="callout-title">中心线 vs 流线</div>
+  <p>
+    在OGGM中，"中心线"（centerline）指从冰川头部到末端的完整几何路径（通常在costgrid中找到），而"流线"（flowline）由<code>elevation_band_flowline</code>从中心线派生，是沿各海拔带"宽度折叠"的一维表示。二者都使用<code>Centerline</code>类。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>6.2 Voronoi成本网格（_make_costgrid）</h2>
+
+<p>
+<code>_make_costgrid</code>（约第684-714行）是中心线提取的核心，将冰川掩码转换为"通过成本最小的路径从末端走到头部"的成本图。成本函数源自Kienholz et al. (2014) 的方法：
+</p>
+
+<pre><code>cost = ((<span class="dec">dmax</span> - dis) / <span class="dec">dmax</span> * <span class="dec">f1</span>)^<span class="dec">a</span>  +  ((z - <span class="dec">zmin</span>) / (<span class="dec">zmax</span> - <span class="dec">zmin</span>) * <span class="dec">f2</span>)^<span class="dec">b</span></code></pre>
+
+<p>
+成本由两项加权和构成：
+</p>
+<ul>
+  <li><strong>距离项</strong>：<code>(dmax-dis)/dmax</code>——距冰川轮廓边界越远的像素成本越低（中央像素受到偏好）。<code>f1</code> 默认0.3，控制距离项的贡献。</li>
+  <li><strong>高程项</strong>：<code>(z-zmin)/(zmax-zmin)</code>——高程越低的像素成本越低（模拟冰的河流式流动特征）。<code>f2</code> 默认0.7，使得高程项权重更高，确保流线向下行走。</li>
+</ul>
+
+<p>
+指数<code>a</code>和<code>b</code>（默认均为1）控制各项的敏感度。此外，对冰川掩码外部和边界像素施加50倍惩罚因子，有效阻止路径"逃出"冰川区域。成本网格的可视化通常呈现为从末端到头部的平滑成本梯度。
+</p>
+
+<!-- ================================================================== -->
+<h2>6.3 冰川头部检测（_get_centerlines_heads）</h2>
+
+<p>
+冰川"头部"是中心线的起点，位于冰川支流的最上游端。<code>_get_centerlines_heads</code>（约第775-817行）使用局部高程极大值检测和自适应过滤来识别它们。
+</p>
+
+<h3>6.3.1 局部极大值检测</h3>
+
+<p>
+对地形数据应用 <code>scipy.signal.argrelmax</code>，扫描高程场的每个像素，当中心像素值高于其邻域所有像素时标记为局部极大值。参数<code>order=5</code> 控制比较范围的窗口大小。
+</p>
+
+<h3>6.3.2 自适应过滤</h3>
+
+<p>
+Kienholz et al. (2014) 中定义了一个与冰川面积相关的缓冲区半径：
+</p>
+
+<pre><code>radius = <span class="dec">q1</span> * area + <span class="dec">q2</span></code></pre>
+
+<p>
+其中<code>q1</code>和<code>q2</code>是经验系数（默认<code>q1=0.15</code>, <code>q2=0</code>）。<code>_filter_heads</code> 函数在此半径内仅保留高程最高的那个局部极大值作为头部候选点。候选点还需要高于高程分布的第33百分位数，过滤掉地形噪声中的微小峰值。
+</p>
+
+<p>
+参数<code>rmax</code> 限制了能检测到的最大头部数量。对于喜马拉雅等山地冰川，通常每个流域产生2-5个头部。
+</p>
+
+<!-- ================================================================== -->
+<h2>6.4 最优路径路由（compute_centerlines）</h2>
+
+<p>
+<code>compute_centerlines</code>（约第874-977行）是中心线提取的主控函数。对每个检测到的头部，从该像素到冰川末端计算一条成本最低的路径。
+</p>
+
+<h3>6.4.1 最短路径算法</h3>
+
+<p>
+路径搜索通过 <code>skimage.graph.route_through_array</code> 实现，它在成本网格上直接执行Dijkstra-like搜索。指定起点（头部）和终点（末端）后，返回一条成本积分最小的路径。
+</p>
+
+<h3>6.4.2 末端识别</h3>
+
+<p>
+末端的确定取决于冰川类型。对于入海型冰川（tidewater），末端为冰川高程分布的某百分位数处（默认第5百分位，确保位于冰舌断裂线附近）。对于陆地终止冰川，末端为冰川范围内的最低高程像素。
+</p>
+
+<h3>6.4.3 线的过滤与连接</h3>
+
+<p>
+中心线后处理包含四个级联步骤：</p>
+
+<ul>
+  <li><strong>_filter_lines</strong>：保留最长的一条线，然后逐步缓冲剩余线——短于主线的重叠线被移除，避免多条线堆积在同一主干上。</li>
+  <li><strong>_filter_lines_slope</strong>：移除沿高程上升行走的线（物理上不合理的"上坡中心线"），通过检查沿线高程的趋势符号实现。</li>
+  <li><strong>_join_lines</strong>：将支流通过几何投影连接到主干的对应交点位置。支流的终点不是主干的终点，而是在主干的side pixel处终止。</li>
+  <li><strong>_line_order</strong>：对整个DAG进行拓扑排序，给每条线赋予<code>order</code>值，类似于河流的Strahler排序，主干最高、小支流最低。</li>
+</ul>
+
+<pre><code><span class="kw">def</span> <span class="fn">_join_lines</span>(<span class="dec">cls</span>, <span class="dec">line</span>, <span class="dec">main_line</span>, <span class="dec">gdir</span>):
+    <span class="cmt"># 1. 获取line的终点像素坐标</span>
+    <span class="cmt"># 2. 在main_line上找到距离最近的像素（几何投影）</span>
+    <span class="cmt"># 3. 沿main_line回溯到line的终点高程之上2dx，作为交汇点</span>
+    <span class="cmt"># 4. 截断line使其在交汇点结束</span>
+    <span class="cmt"># 5. 设置 line.flows_to = main_line</span></code></pre>
+
+<!-- ================================================================== -->
+<h2>6.5 宽度计算（_point_width）</h2>
+
+<p>
+<code>_point_width</code>（约第1375-1444行）计算中心线每个点的冰川宽度。算法如下：
+</p>
+
+<ol>
+  <li>在离散点处沿<strong>法线方向</strong>取长度为 <code>kbuffer * map_dx</code> 的线段。</li>
+  <li>该线段与冰川集水区多边形求交集。</li>
+  <li>交集的长度即为该点处的冰川宽度。</li>
+  <li>如果该点在nunatak（岩壁）内部，从宽度中减去nunatak覆盖的部分。</li>
+</ol>
+
+<p>
+参数<code>kbuffer</code>（默认3.0）确保法线段足够长以跨越整个冰川宽度区域。Nunatak的减法处理是OGGM区别于许多其他模型的重要特性，保证了宽度参数的真实性。
+</p>
+
+<!-- ================================================================== -->
+<h2>6.6 集水区面积与宽度校正</h2>
+
+<h3>6.6.1 集水区面积</h3>
+
+<p>
+<code>catchment_area</code>（约第1549-1662行）通过 <code>salem.Grid</code> 的分水岭算法将冰川划分为多边形的子流域——每个多边形代表一条中心线的汇水区域。集水区边界遵循冰面地形的水文线路，类似于流域边界的概念。
+</p>
+
+<h3>6.6.2 宽度校正（catchment_width_correction）</h3>
+
+<p>
+<code>catchment_width_correction</code>（约第1935-2081行）是一个关键的质量保证步骤。它确保各中心线的面积-高度分布与RGI数据库中该冰川的已知面积相匹配：
+</p>
+
+<ol>
+  <li>将每条中心线的宽度-高程积分为面积-高度分布（分箱为50m高程间隔）。</li>
+  <li>将各中心线的曲线累加，得到总分布。</li>
+  <li>对每个高程箱进行缩放，使总分布与RGI面积一致（bin-based校正）。</li>
+  <li>最终对每条线的所有点的宽度做全球缩放，使总面积精确匹配RGI面积。</li>
+</ol>
+
+<p>
+这个校正步骤确保了OGGM中的几何参数化与RGI的全球冰川清单保持一致，使得区域到全球尺度的体积估算具有可比性。未校正的宽度积分面积与该冰川RGI面积之间的偏差通常小于5%，但仍需精确校正。
+</p>
+
+<!-- ================================================================== -->
+<h2>6.7 海拔带流线（elevation_band_flowline）</h2>
+
+<p>
+<code>elevation_band_flowline</code>（约第2181-2352行）是OGGM 1.4+ 中引入的"折叠冰川"概念的实现（Huss 2012, Werder 2019）。它将每条中心线压缩为一维表示：
+</p>
+
+<pre><code><span class="cmt"># 沿中心线将每个海拔段表示为一个"盒状"单元</span>
+dx = <span class="dec">bsize</span> / tan(slope)   <span class="cmt"># 盒子的长度：高程步长 / 坡度</span>
+width = area / dx         <span class="cmt"># 盒子的宽度：面积 / 长度</span></code></pre>
+
+<p>
+其中<code>bsize</code>是固定的海拔步长（通常200m），<code>slope</code>是该海拔段顶部高程处的当地表面坡度，<code>area</code>是该海拔段内中心线集水区的总面积。这个方案将二维冰川问题映射为一维，极大地加速了冰流模型的数值求解（第10章），同时保留了冰川的整体几何特征。
+</p>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout">
+  <div class="callout-title">折叠冰川与二维模型的权衡</div>
+  <p>
+    折叠冰川方法约化了冰的横向流动——所有冰在同一个海拔段内被假设为垂直于中心线的均匀等速流。对于宽冰川和入海型冰川（其中横向应力梯度重要），这可能导致系统性偏差。Werder等人（2020）的Shallow Ice Approximation模拟显示，1D折叠模型与2D SIA模型在全球冰川体量估算中仅相差约3%。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>6.8 下游线（Downstream Line）</h2>
+
+<p>
+每条中心线都附带一条下游线（<code>downstream_line</code>）——从冰川末端沿地形向更低海拔延伸的线。它用于：
+</p>
+
+<ul>
+  <li>物质平衡模型中确定冰川末端以下的高程外推点</li>
+  <li>冰流模型中定义冰川前缘之外区域的等温条件</li>
+  <li>为入海型冰川计算海底线（submarine bed）以估算崩解通量</li>
+</ul>
+
+<p>
+下游线由 <code>_downstream_line</code> 函数通过沿地形梯度步进生成，步进终点为指定的最低高程或最大长度。
+</p>
+
+<!-- ================================================================== -->
+<h2>6.9 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>所属函数</th><th>默认值</th><th>描述</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>flowline_dx</code></td><td>Centerline构造</td><td>map_dx * 2.0</td><td>中心线离散点的间距</td></tr>
+    <tr><td><code>q1</code></td><td>_get_centerlines_heads</td><td>0.15</td><td>头部缓冲半径的面积系数</td></tr>
+    <tr><td><code>q2</code></td><td>_get_centerlines_heads</td><td>0.0</td><td>头部缓冲半径的偏移量</td></tr>
+    <tr><td><code>rmax</code></td><td>_get_centerlines_heads</td><td>10</td><td>最大头部数量限制</td></tr>
+    <tr><td><code>f1</code></td><td>_make_costgrid</td><td>0.3</td><td>距离项在成本中的权重</td></tr>
+    <tr><td><code>f2</code></td><td>_make_costgrid</td><td>0.7</td><td>高程项在成本中的权重</td></tr>
+    <tr><td><code>a</code></td><td>_make_costgrid</td><td>1.0</td><td>距离项指数（灵敏度）</td></tr>
+    <tr><td><code>b</code></td><td>_make_costgrid</td><td>1.0</td><td>高程项指数（灵敏度）</td></tr>
+    <tr><td><code>kbuffer</code></td><td>_point_width</td><td>3.0</td><td>法线缓冲宽度倍数</td></tr>
+    <tr><td><code>tidewater_percentile</code></td><td>compute_centerlines</td><td>5</td><td>入海型冰川末端高程百分位数</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>6.10 总结</h2>
+
+<p>
+<code>centerlines.py</code> 体现了OGGM工程设计的核心思想：将复杂的冰川几何问题转换为图论中的最短路径问题。Voronoi成本网格、自适应头部检测、流线合并和宽度校正这四个模块相互衔接，每一步都有清晰的物理直觉作支撑。中心线的质量直接决定了后续物质平衡、冰厚反演和动力学演化的精度——一条偏心的中心线会导致错误的宽度、错误的面积-高度分布，并最终影响冰量变化的所有预测。
+</p>
+
+<p>
+在下一章中，将看到气候输入数据如何通过<code>climate.py</code>和<code>shop/</code>模块变换为标准化的<code>climate_historical.nc</code>文件，为物质平衡模型提供气象驱动。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch05.html">第5章：GIS操作与DEM处理</a></span>
+  <span class="next"><a href="ch07.html">第7章：气候数据处理与Shop模块</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源模型技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

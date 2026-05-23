@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第21章 测试框架与质量保障 — OGGM 源码深度解析</title>
+<style>
+:root {
+  --bg: #fffdf8; --fg: #1a1a1a; --accent: #2c5f8a; --accent-light: #e8f0f7;
+  --warn-bg: #fff3cd; --warn-border: #e6b422; --tip-bg: #d4edda; --tip-border: #28a745;
+  --expert-bg: #e2d8f0; --expert-border: #6f42c1; --code-bg: #f4f4f4; --border: #ddd;
+  --tag-beginner: #28a745; --tag-intermediate: #fd7e14; --tag-advanced: #dc3545;
+}
+body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg); line-height: 1.7; }
+h1 { font-size: 2rem; color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: .4rem; margin-top: 2.5rem; }
+h2 { font-size: 1.55rem; color: #1e4a6b; border-bottom: 2px solid #c8d8e8; padding-bottom: .25rem; margin-top: 2.2rem; }
+h3 { font-size: 1.25rem; color: #2c5f8a; margin-top: 1.6rem; }
+h4 { font-size: 1.1rem; color: #444; margin-top: 1.2rem; }
+p { margin: .8rem 0; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: .9rem; line-height: 1.5; }
+code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88em; background: #eee; padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+thead { background: var(--accent); color: #fff; }
+th, td { padding: .5rem .75rem; border: 1px solid var(--border); text-align: left; }
+tbody tr:nth-child(even) { background: #f9f9f9; }
+.callout { padding: .75rem 1rem; border-radius: 6px; margin: 1rem 0; border-left: 5px solid; }
+.callout.warning { background: var(--warn-bg); border-color: var(--warn-border); }
+.callout.tip { background: var(--tip-bg); border-color: var(--tip-border); }
+.callout.expert { background: var(--expert-bg); border-color: var(--expert-border); }
+.callout-title { font-weight: 700; margin-bottom: .25rem; display: block; }
+.tag { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .78rem; color: #fff; margin-right: .4rem; }
+.tag-beginner { background: var(--tag-beginner); }
+.tag-intermediate { background: var(--tag-intermediate); }
+.tag-advanced { background: var(--tag-advanced); }
+.chapter-nav { display: flex; justify-content: space-between; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.chapter-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+footer { text-align: center; color: #888; font-size: .85rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+ul, ol { margin: .5rem 0 .5rem 1.5rem; }
+</style>
+</head>
+<body>
+
+<h1>第21章 测试框架与质量保障</h1>
+<p><span class="tag tag-advanced">Advanced</span> <span class="tag tag-intermediate">Testing &amp; QA</span></p>
+
+<p>
+OGGM 的测试套件是项目质量保障策略的关键组成部分。项目包含着数千行数值计算代码、
+复杂的物理参数化方案以及不断增长的用户群，自动化测试能够确保代码变更不会
+悄无声息地破坏现有功能。本章将介绍测试架构、测试类别、如何运行测试，以及
+如何按照 OGGM 的约定编写新测试。
+</p>
+
+<h2>21.1 测试架构概览</h2>
+
+<p>
+OGGM 使用 <strong>pytest</strong> 作为其测试框架。测试基础设施位于
+<code>oggm/tests/</code> 目录中，围绕共享 fixture、辅助函数和模块化的测试文件套件
+进行组织。
+</p>
+
+<h3>21.1.1 目录结构</h3>
+
+<pre><code>oggm/tests/
+├── __init__.py              # Test package marker
+├── conftest.py              # Shared fixtures and configuration
+├── funcs.py                 # Test helper functions and factories
+├── test_workflow.py         # End-to-end workflow tests
+├── test_models.py           # Flowline model correctness tests
+├── test_prepro.py           # Preprocessing pipeline tests
+├── test_numerics.py         # Numerical accuracy and verification tests
+├── test_utils.py            # Utility function tests
+├── test_graphics.py         # Visualization tests
+├── test_benchmarks.py       # Performance benchmarks
+├── test_shop.py             # Shop / data provider tests
+├── test_sandbox.py          # Sandbox module tests
+├── test_minimal.py          # Minimal functional (smoke) tests
+├── test_workflow.py         # High-level workflow integration tests
+├── test_glathida.py         # GlaThiDa dataset tests
+└── test_rgi.py              # RGI inventory handling tests</code></pre>
+
+<h3>21.1.2 conftest.py：共享 Fixture</h3>
+
+<p>
+<code>conftest.py</code> 文件提供了自动对所有测试文件可用的 fixture。主要的 fixture 包括:
+</p>
+
+<table>
+<thead><tr><th>Fixture</th><th>作用域</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>test_dir</code></td><td>session</td><td>用于测试输出的临时目录，自动清理</td></tr>
+<tr><td><code>mini_gdir</code></td><td>session</td><td>用于快速单元测试的最小 GlacierDirectory</td></tr>
+<tr><td><code>hef_gdir</code></td><td>session</td><td>已完成完整预处理的 Hintereisferner GlacierDirectory</td></tr>
+<tr><td><code>class_gdirs</code></td><td>session</td><td>多个测试冰川的预处理 GlacierDirectory</td></tr>
+<tr><td><code>cfg_init</code></td><td>function</td><td>确保在每个测试之前调用 cfg.initialize()</td></tr>
+</tbody>
+</table>
+
+<h3>21.1.3 funcs.py：辅助函数</h3>
+
+<p>
+<code>funcs.py</code> 包含可复用的测试工具，包括:
+</p>
+<ul>
+  <li><strong>GlacierDirectory 工厂函数：</strong>创建
+      具有不同预处理级别（prepro level）的 gdir 对象，以满足不同的测试需求。</li>
+  <li><strong>断言辅助函数：</strong>用于数值容差、数组比较和 NetCDF
+      文件验证的自定义断言。</li>
+  <li><strong>CAS（Climate-Acquisition-Series）工具：</strong>用于下载
+      和缓存测试气候数据的函数。</li>
+  <li><strong>基准参考生成器：</strong>生成已知正确的输出
+      以用于回归对比。</li>
+</ul>
+
+<h2>21.2 测试类别</h2>
+
+<h3>21.2.1 test_workflow.py：端到端工作流测试</h3>
+
+<p>
+这些测试验证从原始 RGI 轮廓到最终模型输出的完整处理流程。
+它们是覆盖范围最广、同时计算代价也最高的测试。主要场景包括:
+</p>
+<ul>
+  <li><strong>完整预处理流程：</strong>在若干测试冰川上依次运行 GIS 任务、
+      气候任务和反演任务。</li>
+  <li><strong>历史模拟：</strong>从基准年到现在的完整历史模拟，
+      在可获得观测数据的情况下与体积变化进行对比。</li>
+  <li><strong>未来预估：</strong>在 RCP 情景下进行的由 GCM 驱动的未来预估，
+      验证模型在无数值错误的情况下能运行至完成。</li>
+  <li><strong>多冰川工作流：</strong>并行处理多条冰川，
+      以测试带多进程的 <code>execute_entity_task</code>。</li>
+  <li><strong>动态预热（dynamic spinup）：</strong>测试动态预热（dynamic spinup）方法。</li>
+</ul>
+
+<h3>21.2.2 test_models.py：Flowline 模型正确性</h3>
+
+<p>
+这些测试验证 flowline 演变模型的数值正确性，包括:
+</p>
+
+<h4>解析解测试</h4>
+<pre><code>def test_flux_based_model_vs_analytical():
+    """Compare FluxBasedModel against an analytical solution.
+
+    For a constant-width slab with constant mass balance, the SIA
+    has a known equilibrium profile. This test verifies that the
+    numerical model converges to within tolerance of that profile.
+    """
+    from oggm.tests.funcs import idealised_gdir
+    # ...idealised glacier setup...
+    # Compare numerical equilibrium vs. analytical profile
+    np.testing.assert_allclose(
+        modeled.surface_h, analytical.surface_h,
+        atol=1.0, rtol=0.01
+    )</code></pre>
+
+<h4>质量守恒测试</h4>
+<pre><code>class MassConservationChecker:
+    """Utility class for verifying mass conservation in flowline models.
+
+    Checks:
+    1. Volume change = integrated mass balance * dt
+    2. No mass creation or destruction at domain boundaries
+    3. Mass flux continuity across flowline junctions
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.initial_volume = self._compute_total_volume()
+
+    def check_step(self, dt, mb_model):
+        """Verify conservation over one time step."""
+        v_before = self._compute_total_volume()
+        self.model.step(dt)
+        v_after = self._compute_total_volume()
+        mb_int = self._integrate_mass_balance(dt, mb_model)
+        # Volume change should match integrated mass balance
+        np.testing.assert_allclose(
+            v_after - v_before, mb_int * dt,
+            rtol=0.1  # allow some tolerance for numerical diffusion
+        )
+
+    def _compute_total_volume(self):
+        return sum(fl.volume_km3 for fl in self.model.fls) * 1e9
+
+    def _integrate_mass_balance(self, dt, mb_model):
+        total = 0.0
+        for fl in self.model.fls:
+            mb = mb_model.get_annual_mb(fl.surface_h)
+            area = fl.widths_m * fl.dx_meter
+            total += (mb * area).sum()
+        return total</code></pre>
+
+<h4>CFL 条件测试</h4>
+<pre><code>def test_cfl_compliance():
+    """Verify adaptive time-stepping respects the CFL condition.
+
+    The CFL number (u * dt / dx) must be ≤ 1 for explicit schemes
+    and ≤ ~5 for semi-implicit schemes with the production model.
+    """</code></pre>
+
+<h3>21.2.3 test_prepro.py：预处理流程</h3>
+
+<p>GIS 和中心线处理流程的测试：</p>
+<ul>
+  <li><strong>DEM 处理：</strong>针对 <code>process_dem()</code> 的测试，
+      涵盖不同的 DEM 来源、分辨率和投影。</li>
+  <li><strong>冰川掩膜计算：</strong>验证冰川掩膜对于简单和复杂冰川几何形状
+      都能正确识别冰川内的像素。</li>
+  <li><strong>中心线计算：</strong>测试几何中心线提取，包括支流检测和汇合点处理。</li>
+  <li><strong>Flowline 初始化：</strong>验证宽度计算、面积-高度分布和网格分辨率一致性。</li>
+  <li><strong>集水区划分：</strong>测试集水区是否连续且覆盖预期面积。</li>
+</ul>
+
+<h3>21.2.4 test_numerics.py：数值精度</h3>
+
+<p>这些测试验证 OGGM 中使用的各种数值算法的正确性：</p>
+<ul>
+  <li><strong>扩散率计算：</strong>在不同厚度和坡度下测试冰的扩散率公式。</li>
+  <li><strong>通量计算：</strong>测试通量限制器（flux limiter）和 SIA 通量公式。</li>
+  <li><strong>插值：</strong>测试气候和物质平衡模块中使用的插值程序。</li>
+  <li><strong>梯度计算：</strong>测试表面和床面坡度计算。</li>
+  <li><strong>积分：</strong>测试反演模块中的数值求积。</li>
+  <li><strong>容差测试：</strong>每个数值程序都应以至少 1e-6 的相对误差
+      对照参考实现进行容差验证。</li>
+</ul>
+
+<h3>21.2.5 test_utils.py：工具函数</h3>
+
+<p>通用工具的测试：</p>
+<ul>
+  <li><strong>GlacierDirectory：</strong>文件 I/O、路径解析、BASENAMES 查找。</li>
+  <li><strong>月度时间序列：</strong><code>monthly_timeseries</code> DataFrame 的
+      创建、重采样和聚合。</li>
+  <li><strong>几何函数：</strong>多边形操作、面积计算和坐标变换。</li>
+  <li><strong>Config 函数：</strong><code>pack_config</code>、<code>unpack_config</code>、
+      参数校验。</li>
+  <li><strong>NetCDF I/O：</strong>读取和写入带有正确元数据的 NetCDF 文件。</li>
+</ul>
+
+<h3>21.2.6 test_graphics.py：可视化测试</h3>
+
+<p>
+可视化测试使用 matplotlib 的测试基础设施来验证绘图函数能够无错误地执行
+并生成预期的视觉元素：
+</p>
+<ul>
+  <li><strong>图形生成：</strong>使用测试数据调用每个绘图函数，
+      并验证生成的图形包含预期的图形元素（线条、多边形、标签）。</li>
+  <li><strong>坐标轴标签和标题：</strong>验证坐标轴标签是否正确设置。</li>
+  <li><strong>地图投影：</strong>测试基于 cartopy 的地图绘图，
+      验证其使用了正确的坐标参考系统。</li>
+  <li><strong>文件输出：</strong>测试图形是否能够以 PNG 和 PDF
+      格式保存到磁盘。</li>
+</ul>
+
+<h3>21.2.7 test_benchmarks.py：性能测试</h3>
+
+<p>
+基准测试确保性能关键的操作保持在可接受的时间范围内。关键指标：
+</p>
+<ul>
+  <li><strong>预处理速度：</strong>端到端预处理单条冰川所需的时间。</li>
+  <li><strong>反演速度：</strong>反演 100 个 flowline 点的冰厚度所需的时间。</li>
+  <li><strong>演变速度：</strong>进行 100 年模拟时每秒可处理的模型年数。</li>
+  <li><strong>内存使用：</strong>处理 100 条冰川清单时的峰值内存。</li>
+</ul>
+
+<h3>21.2.8 test_minimal.py：冒烟测试（Smoke Tests）</h3>
+
+<p>
+最小功能测试（冒烟测试），能够在 60 秒内运行完毕，验证核心 API 是否可用：
+</p>
+<pre><code>def test_import_oggm():
+    import oggm
+    assert oggm.__version__ is not None
+
+def test_cfg_initialize():
+    from oggm import cfg
+    cfg.initialize()
+    assert cfg.PARAMS['continue_on_error'] is False
+
+def test_get_demo_file():
+    from oggm.utils import get_demo_file
+    f = get_demo_file('Hintereisferner_RGI5.shp')
+    assert os.path.exists(f)</code></pre>
+
+<h2>21.3 测试 Fixture 与 GlacierDirectory 工厂</h2>
+
+<p>
+创建测试用 GlacierDirectory 是一个常见需求。OGGM 在 <code>funcs.py</code>
+中提供了工厂函数：
+</p>
+
+<pre><code># Create a minimal GlacierDirectory from a demo shapefile
+def get_test_gdir(minimal=False, border=None):
+    """Factory for test GlacierDirectory objects.
+
+    Parameters
+    ----------
+    minimal : bool
+        If True, create a bare GlacierDirectory with just the RGI outline.
+        If False, run the full preprocessing pipeline.
+    border : int, optional
+        Map border in pixels.
+
+    Returns
+    -------
+    GlacierDirectory
+    """
+    from oggm.utils import get_demo_file, GlacierDirectory
+    from oggm import workflow
+    cfg.initialize()
+    rgi_file = get_demo_file('Hintereisferner_RGI5.shp')
+    gdir = GlacierDirectory(rgi_file)
+    if not minimal:
+        workflow.gis_prepro_tasks(gdir)
+    return gdir</code></pre>
+
+<h2>21.4 回归测试：与已知输出进行对比</h2>
+
+<p>
+OGGM 维护一组用于回归测试的参考输出。这些输出由已知正确的代码版本生成，
+并以压缩形式存储在测试套件中。当代码发生变更时，回归测试会验证输出结果是否
+保持一致（或在容差范围内一致）。
+</p>
+
+<pre><code>def test_inversion_regression():
+    """Verify that the mass-conservation inversion produces consistent results."""
+    from oggm.core.inversion import mass_conservation_inversion
+    from oggm.tests.funcs import get_benchmark_data
+
+    gdir = get_test_gdir()
+    # Run inversion
+    mass_conservation_inversion(gdir)
+    result = gdir.read_pickle('inversion_output')
+
+    # Compare against benchmark
+    benchmark = get_benchmark_data('inversion_hintereis')
+    for vn in ['volume', 'thickness']:
+        v_new = result[vn]
+        v_ref = benchmark[vn]
+        np.testing.assert_allclose(
+            v_new, v_ref, rtol=1e-3,
+            err_msg=f"{vn} regression failure"
+        )</code></pre>
+
+<h2>21.5 持续集成：GitHub Actions</h2>
+
+<p>
+OGGM 使用 GitHub Actions 进行持续集成。CI 工作流定义在
+<code>.github/workflows/</code> 目录中，通常包括以下作业：
+</p>
+
+<table>
+<thead><tr><th>作业</th><th>触发条件</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>tests</code></td><td>Push、PR</td><td>在多个 Python 版本（3.9、3.10、3.11）上运行完整测试套件</td></tr>
+<tr><td><code>minimal</code></td><td>Push、PR</td><td>冒烟测试；作为快速门禁最先运行</td></tr>
+<tr><td><code>docs</code></td><td>Push 到 master</td><td>构建并部署 Sphinx 文档</td></tr>
+<tr><td><code>lint</code></td><td>Push、PR</td><td>代码风格检查（flake8、black）</td></tr>
+<tr><td><code>benchmarks</code></td><td>定时调度、PR 标签</td><td>性能回归检测</td></tr>
+</tbody>
+</table>
+
+<div class="callout tip">
+<span class="callout-title">提示：在本地运行 CI</span>
+使用 <code>tox</code> 在本地运行与 GitHub Actions 执行的相同的测试矩阵：
+<pre><code># Run all test environments
+tox
+
+# Run just the tests for Python 3.10
+tox -e py310
+
+# Run linting only
+tox -e lint</code></pre>
+</div>
+
+<h2>21.6 测试数据：oggm-sample-data 仓库</h2>
+
+<p>
+OGGM 维护一个独立的仓库 <code>OGGM/oggm-sample-data</code>，
+其中包含轻量级的测试数据集：
+</p>
+<ul>
+  <li><strong>RGI shapefile：</strong>用于测试的 RGI 冰川轮廓小规模子集。</li>
+  <li><strong>DEM 瓦片：</strong>覆盖测试冰川的低分辨率 DEM 子集。</li>
+  <li><strong>气候数据：</strong>适用于测试冰川的预处理气候时间序列。</li>
+  <li><strong>预处理目录：</strong>缓存的已处理 GlacierDirectory，
+      用于加快测试执行速度。</li>
+  <li><strong>基准输出：</strong>用于回归测试的参考输出。</li>
+</ul>
+
+<p>
+<code>oggm.utils</code> 中的 <code>get_demo_file()</code> 函数负责透明地
+下载并缓存这些文件。
+</p>
+
+<h2>21.7 外部参考实现：ext/sia_fluxlim.py</h2>
+
+<p>
+<code>oggm/ext/sia_fluxlim.py</code> 模块包含了 SIA 通量限制器（flux limiter）算法的独立
+参考实现。这段外部代码不在业务化运行环境中使用，而是作为验证靶标：
+</p>
+<ul>
+  <li>由不同的作者编写，对同一数学问题采用了不同的算法方法。</li>
+  <li>在测试中用于验证业务化运行环境实现是否产生相同的结果（在浮点容差范围内）。</li>
+  <li>为通量限制器（flux limiter）提供了一个独立于生产代码中任何优化或简化的"真实基准（ground truth）"。</li>
+</ul>
+
+<h2>21.8 如何运行测试</h2>
+
+<h3>21.8.1 基本命令</h3>
+
+<pre><code># Run the entire test suite
+pytest
+
+# Run a specific test file
+pytest oggm/tests/test_models.py
+
+# Run a specific test function
+pytest oggm/tests/test_models.py::test_flux_based_model_init
+
+# Run tests matching a keyword expression
+pytest -k "inversion"
+
+# Run tests with verbose output
+pytest -v
+
+# Run tests and stop on first failure
+pytest -x
+
+# Run tests in parallel (requires pytest-xdist)
+pytest -n 4</code></pre>
+
+<h3>21.8.2 测试标记</h3>
+
+<p>OGGM 使用 pytest 标记对测试进行分类：</p>
+
+<pre><code># Run only slow tests
+pytest -m slow
+
+# Skip graphics tests (no display available)
+pytest -m "not test_graphics"
+
+# Run only the workflow integration tests
+pytest -m workflow
+
+# See all available markers
+pytest --markers</code></pre>
+
+<table>
+<thead><tr><th>标记</th><th>描述</th><th>典型耗时</th></tr></thead>
+<tbody>
+<tr><td><code>@pytest.mark.slow</code></td><td>需要大量计算资源的测试</td><td>&gt; 30 秒</td></tr>
+<tr><td><code>@pytest.mark.workflow</code></td><td>端到端工作流集成测试</td><td>&gt; 60 秒</td></tr>
+<tr><td><code>@pytest.mark.test_graphics</code></td><td>需要显示环境 / matplotlib 的测试</td><td>&lt; 10 秒</td></tr>
+<tr><td><code>@pytest.mark.test_benchmarks</code></td><td>性能基准测试</td><td>不固定</td></tr>
+</tbody>
+</table>
+
+<h2>21.9 编写新测试</h2>
+
+<h3>21.9.1 模式：Entity Task 测试</h3>
+
+<pre><code>import pytest
+import numpy as np
+import oggm
+from oggm import workflow
+from oggm.utils import get_demo_file, GlacierDirectory
+from oggm.tests.funcs import get_test_gdir
+
+class TestMyNewTask:
+    """Test suite for my_new_custom_task."""
+
+    @classmethod
+    def setup_class(cls):
+        """Create shared test resources once per class."""
+        oggm.cfg.initialize()
+        cls.gdir = get_test_gdir(minimal=True)
+
+    def test_task_returns_expected_type(self):
+        """The task should return a dict with required keys."""
+        from my_module import my_new_task
+        result = my_new_task(self.gdir)
+        assert isinstance(result, dict)
+        assert 'required_key_1' in result
+        assert 'required_key_2' in result
+
+    def test_task_output_written_to_disk(self):
+        """The task should write output to the glacier directory."""
+        from my_module import my_new_task
+        my_new_task(self.gdir)
+        output_path = self.gdir.get_filepath('my_new_output')
+        assert os.path.exists(output_path)
+
+    def test_task_numerical_accuracy(self):
+        """Output values should be within physical bounds."""
+        from my_module import my_new_task
+        result = my_new_task(self.gdir)
+        assert 0 <= result['volume_km3'] <= 1e6  # No glacier > 10^6 km³
+
+    def test_task_edge_case_empty_glacier(self):
+        """The task should handle glaciers with zero thickness."""
+        # Create a pathological glacier directory
+        # ...
+        from my_module import my_new_task
+        result = my_new_task(empty_gdir)
+        assert result['volume_km3'] == 0.0
+
+    def test_task_deterministic(self):
+        """Same inputs should produce identical outputs."""
+        from my_module import my_new_task
+        r1 = my_new_task(self.gdir, seed=42)
+        r2 = my_new_task(self.gdir, seed=42)
+        assert r1['value'] == r2['value']</code></pre>
+
+<h3>21.9.2 模式：数值验证</h3>
+
+<pre><code>def test_my_numerical_function():
+    """Verify numerical correctness against analytical reference."""
+    from my_module import my_numerical_function
+
+    # Known analytical case
+    x = np.linspace(0, 1, 100)
+    y_numerical = my_numerical_function(x)
+    y_analytical = known_analytical_solution(x)
+
+    # Relative error should be small
+    rel_error = np.abs(y_numerical - y_analytical) / (np.abs(y_analytical) + 1e-10)
+    assert np.max(rel_error) < 1e-6
+
+    # Mass/energy should be conserved
+    integral_numerical = np.trapz(y_numerical, x)
+    integral_analytical = np.trapz(y_analytical, x)
+    assert np.abs(integral_numerical - integral_analytical) < 1e-8</code></pre>
+
+<h2>21.10 覆盖率与质量指标</h2>
+
+<p>OGGM 使用 <code>pytest-cov</code> 跟踪代码覆盖率：</p>
+
+<pre><code># Run tests with coverage
+pytest --cov=oggm --cov-report=html
+
+# View coverage report
+# open htmlcov/index.html</code></pre>
+
+<p>虽然 OGGM 不强制要求严格的覆盖率百分比，但遵循以下准则：</p>
+<ul>
+  <li><strong>核心模块：</strong>每个公共函数应至少有一个测试。</li>
+  <li><strong>数值程序：</strong>应在多个参数值下进行测试，
+      并在可能的情况下与解析解进行比对。</li>
+  <li><strong>Shop 模块：</strong>至少需要一个冒烟测试，
+      验证模块能够导入且其下载函数可以被调用。</li>
+  <li><strong>错误路径：</strong>测试应覆盖预期的失败模式
+      （无效输入、缺失数据、损坏文件）。</li>
+</ul>
+
+<p>
+额外的质量门禁包括：
+</p>
+<ul>
+  <li><strong>代码检查（Linting）：</strong>使用 flake8 进行风格检查，
+      在 <code>setup.cfg</code> 中维护项目特有的配置。</li>
+  <li><strong>类型检查：</strong>使用 mypy 逐步引入类型注解（按模块选择加入）。</li>
+  <li><strong>文档：</strong>Sphinx 构建必须无警告地完成。</li>
+  <li><strong>安全：</strong>使用 Dependabot 进行依赖漏洞扫描。</li>
+</ul>
+
+<div class="chapter-nav">
+  <a href="ch20.html">← 第20章 扩展OGGM</a>
+  <a href="tutorials.html">第22章 OGGM教程全集 →</a>
+</div>
+
+<footer>
+  OGGM 源码深度解析 &mdash; 第21章 测试框架与质量保障
+</footer>
+
+</body>
+</html>

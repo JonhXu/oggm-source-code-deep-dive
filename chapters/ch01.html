@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第1章 冰川模拟与OGGM概述 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第1章 冰川模拟与OGGM概述</h1>
+
+<p>
+冰川模拟是现代冰冻圈科学的重要组成部分。山地冰川是当前海平面上升的重要来源之一，其未来演变还直接影响区域水资源、冰川灾害风险和气候变化影响评估。本章介绍冰川模拟的基本概念、发展历史，以及开放全球冰川模型（OGGM）在这一领域中的定位。
+</p>
+
+<!-- ================================================================== -->
+<h2>1.1 什么是冰川模拟</h2>
+
+<p>
+冰川模拟是指利用物理和数学方法，在计算机中对冰川的物质平衡（积累与消融）、冰体流动动力学和几何形态演变进行数值再现。其核心目标是回答三个关键问题：
+</p>
+
+<ul>
+  <li><strong>物质平衡：</strong>冰川每年净积累或损失了多少冰？这由降雪（积累）与融化（消融）的差额决定。</li>
+  <li><strong>冰流动：</strong>积累区的冰如何通过内部变形和基底滑动输送到消融区？这受控于冰的流变学性质（Glen定律）和基底条件。</li>
+  <li><strong>几何响应：</strong>冰川的长度、厚度和面积如何随时间调整以适应气候变化？这涉及冰川动力学中的"响应时间"概念，通常为几十年到几个世纪。</li>
+</ul>
+
+<span class="tag tag-beginner">入门</span>
+<p>
+<strong>冰川模拟为何重要？</strong>现场测量（如物质平衡观测、冰厚度雷达）只能覆盖全球约25万条冰川中的几百条。模型是将这些点状观测扩展到区域和全球尺度的主要手段。此外，模型允许我们进行"假设分析"——当温度上升2度或4度时，冰川将如何响应？这类反事实推演是IPCC评估报告的核心内容。
+</p>
+
+<!-- ================================================================== -->
+<h2>1.2 全球冰川模型简史</h2>
+
+<p>
+全球冰川模拟的历史可大致分为三个阶段：
+</p>
+
+<h3>1.2.1 早期经验模型（1980s--2000s）</h3>
+<p>
+最早期的全球尺度冰川研究依赖于度日模型（degree-day model）和简单的体积-面积缩放关系（volume-area scaling）。Bahr等人在1997年提出的体积-面积幂律关系 V = cA^γ 为从面积推断冰体积提供了理论依据。这类方法的优点是计算成本极低，但缺点是无法模拟冰川动力学（如冰川前进和退缩）。
+</p>
+
+<h3>1.2.2 浅冰近似时代（2010s）</h3>
+<p>
+浅冰近似（Shallow Ice Approximation, SIA）的引入标志着全球冰川模拟进入新纪元。SIA是完整Stokes方程在冰川纵横比很小（厚度/长度约为10^{-3}量级）的条件下的简化形式，它将冰流动简化为仅由局部地表坡度和冰厚度驱动的层流。虽然SIA忽略了纵向应力梯度，但对于山地冰川（相对于冰盖），SIA在大多数区域是一个合理的近似。
+</p>
+
+<p>
+2010年代早期，出现了多个基于SIA的全球冰川演化模型，包括GloGEM（Huss & Hock, 2015）、PyGEM（Rounce et al., 2020）、以及OGGM（Maussion et al., 2019）。
+</p>
+
+<h3>1.2.3 全Stokes与混合方案的探索（2020s--）</h3>
+<p>
+近期的发展趋势包括：使用更高阶的冰流动力学近似（如Blatter-Pattyn近似）、改进入海型冰川的崩解（calving）参数化，以及尝试用统计或机器学习替代模型加速大规模计算。OGGM在v1.4及之后版本中加入了基于Oerlemans & Nick（2005）思路的k-calving方案，并在后续版本中继续改进入海型冰川的反演和正演处理。
+</p>
+
+<span class="tag tag-intermediate">进阶</span>
+<p>
+<strong>SIA的数学形式：</strong>在SIA下，水平冰流速 u(z) 由 Glen 流变定律和剪切应力积分给出。对于等温冰体，深度平均的速度为：
+</p>
+<pre><code>u_bar = (2A/(n+2)) * (ρg)^n * h^(n+1) * |∇S|^(n-1) * ∇S
+其中 A 为Glen流变参数（~2.4e-24 Pa^{-3} s^{-1}），n = 3 为应力指数，
+ρ = 900 kg/m^3 为冰密度，g = 9.81 m/s^2，h 为冰厚度，S 为冰面高程。</code></pre>
+
+<p>
+OGGM的生产工作流主要使用一维流线模型：在每条流线上用SIA形式计算冰通量，并用多流线结构表示主干与支流的汇合关系。与单一流线相比，多流线方案能更好保留复杂山谷冰川的面积-高度分布和支流贡献。
+</p>
+
+<!-- ================================================================== -->
+<h2>1.3 OGGM的项目定位与设计目标</h2>
+
+<p>
+OGGM（Open Global Glacier Model）由Fabien Maussion、Ben Marzeion等人在奥地利因斯布鲁克大学发起，首个公开版本v1.0于2017年发布。其设计哲学可以概括为四个关键词：
+</p>
+
+<ul>
+  <li><strong>全球化（Global applicability）：</strong>OGGM能够处理Randolph Glacier Inventory (RGI)中任意一条冰川，无论其位于阿拉斯加的入海型冰川还是喜马拉雅的山谷冰川。这是通过完全自动化的工作流实现的——只需提供RGI ID即可运行完整模拟。</li>
+  <li><strong>模块化（Modularity）：</strong>核心处理管线被分解为独立的任务（tasks），每个任务负责一个明确定义的步骤（如计算中心线、插值气候数据、求解冰厚度等）。这些任务可以单独运行、测试、替换或重新排序。</li>
+  <li><strong>开源协作（Open-source）：</strong>OGGM采用BSD-3-Clause许可证托管在GitHub上。项目通过公开 issue、pull request、文档和持续集成（CI）维护模型行为的可追踪性。</li>
+  <li><strong>教学友好（Education-friendly）：</strong>OGGM提供了丰富的教程（notebooks），配有面向教学的预处理数据集，使冰川学研究生能够在个人电脑上完成单冰川或小区域模拟实验。</li>
+</ul>
+
+<span class="tag tag-beginner">入门</span>
+<div class="callout tip">
+  <div class="callout-title">提示：开始使用OGGM</div>
+  <p>
+    如果你是冰川模拟的新手，推荐从OGGM官方教程开始：<code>pip install oggm</code> 后在Jupyter Notebook中运行 <code>import oggm</code>。OGGM提供了三个难度级别的教程：Beginner（使用预处理的示例冰川）、Intermediate（理解每条工作流步骤）和Advanced（自定义参数和开发新功能）。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>1.4 OGGM与同类模型的对比</h2>
+
+<p>
+下表总结了OGGM与当前其他主流全球冰川模型的区别：
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>特征</th>
+      <th>OGGM v1.6</th>
+      <th>PyGEM</th>
+      <th>GloGEM</th>
+      <th>JULES-ICE</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>冰流动模型</td>
+      <td>多流线SIA</td>
+      <td>无（仅物质平衡）</td>
+      <td>简单参数化（delta-h）</td>
+      <td>单流线SIA</td>
+    </tr>
+    <tr>
+      <td>物质平衡</td>
+      <td>月度温度指数模型（MonthlyTIModel, temperature-index model，可含辐射项）</td>
+      <td>月度温度指数模型（MonthlyTIModel, temperature-index model）</td>
+      <td>月度温度指数模型（MonthlyTIModel, temperature-index model）</td>
+      <td>能量平衡</td>
+    </tr>
+    <tr>
+      <td>冰厚度反演</td>
+      <td>物理反演（逆SIA）</td>
+      <td>体积-面积缩放</td>
+      <td>体积-面积缩放</td>
+      <td>物理反演</td>
+    </tr>
+    <tr>
+      <td>冰川崩解</td>
+      <td>有（Oerlemans + 厚度判据）</td>
+      <td>无</td>
+      <td>无</td>
+      <td>无</td>
+    </tr>
+    <tr>
+      <td>自动预处理</td>
+      <td>全自动（DEM/RGI/气候数据工作流）</td>
+      <td>全自动</td>
+      <td>半自动</td>
+      <td>依赖外部驱动</td>
+    </tr>
+    <tr>
+      <td>编程语言</td>
+      <td>Python（开源）</td>
+      <td>Python（开源）</td>
+      <td>MATLAB（闭源）</td>
+      <td>Fortran（开源）</td>
+    </tr>
+    <tr>
+      <td>典型用途</td>
+      <td>从单条冰川到全球模拟</td>
+      <td>全球物质平衡与径流</td>
+      <td>全球冰川演化</td>
+      <td>陆面模型中的冰川分量</td>
+    </tr>
+    <tr>
+      <td>RGI v6 全量运行时间</td>
+      <td>~数天（并行，256核）</td>
+      <td>~数小时</td>
+      <td>~数小时</td>
+      <td>~数天</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="callout-title">关键区别</div>
+  <p>
+    OGGM的主要差异化优势在于其<strong>流程一致性</strong>：从地形预处理、物质平衡校准、冰厚反演到动力演化，关键中间量都保存在同一套GlacierDirectory结构中，便于追踪和复现实验。需要注意的是，OGGM可以分别设置反演和正演使用的Glen参数；是否保持一致取决于参数配置。基于体积-面积缩放或delta-h参数化的模型计算更快，但对冰川前进、退缩和崩解等瞬态动力过程的表达更受限制。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>1.5 OGGM的科学贡献</h2>
+
+<p>
+自发布以来，OGGM已在多个重要科学评估中发挥核心作用：
+</p>
+
+<ul>
+  <li><strong>IPCC第六次评估报告（AR6, 2021）：</strong>OGGM参与了全球冰川模型集合预估，为AR6中冰川对海平面上升贡献的评估提供了模型证据之一。不同排放情景下的体积损失范围取决于基准年、区域分组和模型集合，阅读原始评估时应避免把单一模型结果误读为确定值。</li>
+  <li><strong>全球冰川变化（GlaMBIE, 2024）：</strong>在由21个研究团队参与的"冰川物质平衡比对实验"（Glacier Mass Balance Intercomparison Exercise）中，OGGM是核心驱动模型之一，为2000-2023年间冰川质量变化的社区评估提供了关键约束。</li>
+  <li><strong>水文灾害评估：</strong>OGGM被用于评估安第斯山脉、高亚洲和阿尔卑斯山地区的冰川湖溃决洪水（GLOF）风险，对下游数百万人口的防灾减灾规划具有直接指导意义。</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>1.6 关键出版物</h2>
+
+<p>
+以下是使用或引用OGGM的标志性论文：
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>论文</th>
+      <th>期刊</th>
+      <th>核心贡献</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Maussion et al. (2019)</td>
+      <td>Geosci. Model Dev.</td>
+      <td>OGGM v1.0 模型描述论文</td>
+    </tr>
+    <tr>
+      <td>Rounce et al. (2023)</td>
+      <td>Science</td>
+      <td>全球冰川质量损失预估（含OGGM）</td>
+    </tr>
+    <tr>
+      <td>Marzeion et al. (2020)</td>
+      <td>J. Glaciol.</td>
+      <td>OGGM v1.2 冰厚度反演验证</td>
+    </tr>
+    <tr>
+      <td>Eis et al. (2021)</td>
+      <td>Cryosphere</td>
+      <td>OGGM预处理管线与W5E5气候驱动</td>
+    </tr>
+    <tr>
+      <td>Zekollari et al. (2022)</td>
+      <td>Cryosphere</td>
+      <td>OGGM v1.6 冰川崩解参数化</td>
+    </tr>
+    <tr>
+      <td>Schuster et al. (2023)</td>
+      <td>Geosci. Model Dev.</td>
+      <td>OGGM-Edu：面向教学的简化版</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>1.7 OGGM版本历史</h2>
+
+<p>
+OGGM的版本演进反映了其功能的逐步完善：
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>版本</th>
+      <th>发布日期</th>
+      <th>主要变更</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>v1.0</td>
+      <td>2019-02</td>
+      <td>初始稳定版：中心线计算、气候插值、冰厚度反演、动力演化</td>
+    </tr>
+    <tr>
+      <td>v1.1</td>
+      <td>2019-09</td>
+      <td>改进的DEM插值、并行处理支持</td>
+    </tr>
+    <tr>
+      <td>v1.2</td>
+      <td>2020-04</td>
+      <td>冰厚度反演改进、交叉验证框架</td>
+    </tr>
+    <tr>
+      <td>v1.3</td>
+      <td>2020-11</td>
+      <td>W5E5气候驱动集成、南半球支持</td>
+    </tr>
+    <tr>
+      <td>v1.4</td>
+      <td>2021-09</td>
+      <td>冰川崩解模块、月气候强迫</td>
+    </tr>
+    <tr>
+      <td>v1.5</td>
+      <td>2022-06</td>
+      <td>动态融化模型改进、区域气候模型接口</td>
+    </tr>
+    <tr>
+      <td>v1.6</td>
+      <td>2023-04</td>
+      <td>改进的冰川崩解判据、elevation-band flowline替代方案</td>
+    </tr>
+    <tr>
+      <td>v1.6.3</td>
+      <td>2024-12</td>
+      <td>最新维护版本：bug修复、GMD气候驱动更新</td>
+    </tr>
+  </tbody>
+</table>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">版本迁移注意事项</div>
+  <p>
+    如果你正在维护依赖OGGM的旧代码，请注意不同版本的prepro目录、参数默认值和文件名可能不兼容。<code>grid_dx_method</code>、气候校准策略、RGI版本等设置都会影响GlacierDirectory的内容。建议在迁移前备份已处理数据，并用目标版本重新运行完整预处理。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>1.8 RGI：OGGM的数据基础</h2>
+
+<p>
+Randolph Glacier Inventory (RGI) 是全球冰川模拟的共同基石。RGI第一版于2012年发布，最新版为RGI 7.0（2023年发布），包含了全球约<strong>27.5万条</strong>冰川的轮廓（outline）数据，覆盖除南极和格陵兰冰盖外的所有冰川区域。
+</p>
+
+<p>
+对于每条冰川，RGI至少提供：
+</p>
+
+<ul>
+  <li><strong>RGI ID：</strong>形如 <code>RGI60-11.00001</code> 的唯一标识符，前两位为区域代码</li>
+  <li><strong>几何信息：</strong>冰川轮廓多边形，以WGS84经纬度坐标存储</li>
+  <li><strong>属性数据：</strong>冰川名称、面积、最高/最低高程、连接关系等</li>
+</ul>
+
+<p>
+OGGM的工作流从RGI出发，通过以下步骤构建每条冰川的可复现实例：提取轮廓 → 获取DEM → 计算中心线 → 沿流线参数化 → 气候数据插值 → 冰厚度反演 → 动力演化。RGI是这个流程的入口数据，也是后续几何约束的基础。
+</p>
+
+<div class="callout warning">
+  <div class="callout-title">中国与高亚洲应用的第一检查项</div>
+  <p>在青藏高原、天山、祁连山、横断山等区域使用OGGM时，应先检查RGI边界、DEM来源、冰湖/湖泊终止类型、碎屑覆盖和跃动冰川清单。许多误差并非来自SIA求解器，而是来自输入几何、降水订正和物质平衡校准。区域研究建议先做小样本人工诊断，再扩大到全区域批处理。</p>
+</div>
+
+<span class="tag tag-advanced">专家</span>
+<div class="callout expert">
+  <div class="callout-title">RGI版本差异对模型结果的影响</div>
+  <p>
+    RGI 6.0与RGI 7.0之间存在显著差异：RGI 7.0修正了约15%的冰川面积和约8%的分水岭归属。研究模拟表明，简单地将RGI 6.0训练的模型参数直接应用于RGI 7.0的边界数据，会导致全球冰体积估算产生约5-10%的偏差。因此OGGM为RGI 6.0和RGI 7.0分别提供了独立的预处理数据包。本书分析主要基于OGGM v1.6.x配合RGI 6.0的使用场景。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>1.9 本书的结构与阅读指南</h2>
+
+<p>
+本书按"由外而内、由总到分"的原则组织，分为六个部分：
+</p>
+
+<ul>
+  <li><strong>第一部分（第1-4章，架构概览）：</strong>介绍OGGM的整体架构、配置系统和数据中枢，为后续深入源码奠定基础。</li>
+  <li><strong>第二部分（第5-9章，预处理管线）：</strong>逐一剖析GIS/DEM、中心线、气候数据、物质平衡模型和冰厚反演。</li>
+  <li><strong>第三部分（第10-14章，冰动力学）：</strong>深入流线模型、数值方法、崩解、动态预热（dynamic spinup）和二维SIA模块。</li>
+  <li><strong>第四至第六部分（第15-22章与附录）：</strong>介绍工作流、CLI、并行计算、可视化、扩展开发、测试框架、教程和速查资料。</li>
+</ul>
+
+<p>
+每章开头使用标签标记内容的受众：
+<span class="tag tag-beginner">入门</span> 适合冰川研究新生（研究生）；
+<span class="tag tag-intermediate">进阶</span> 适合有一定建模经验的冰川学家；
+<span class="tag tag-advanced">专家</span> 适合希望深入修改源码的高级用户。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span style="visibility:hidden" class="prev"><a href="#">上一章</a></span>
+  <span class="next"><a href="ch02.html">第2章：架构总览与设计哲学</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源模型技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

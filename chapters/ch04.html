@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第4章 GlacierDirectory：数据中枢 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第4章 GlacierDirectory：数据中枢</h1>
+
+<p>
+<code>GlacierDirectory</code> 是OGGM架构中核心的数据结构。它不仅仅是一个文件路径管理器——它是每条冰川在整个建模生命周期中的"可复现实例"的数据锚点。从GIS预处理到气候数据插值、物质平衡校准、冰厚度反演，再到最终的动力学演化，所有的输入和输出文件都通过GlacierDirectory的接口进行读写。本章深入剖析 <code>oggm/utils/_workflow.py</code> 中GlacierDirectory类的源码（约第2643-3960行，共约1300行）。
+</p>
+
+<!-- ================================================================== -->
+<h2>4.1 类的整体定位</h2>
+
+<p>
+GlacierDirectory在OGGM中的角色可以类比为：它是一个冰川实体的<strong>"文件系统抽象层"</strong>。对于调用者（core模块中的各个entity_task）来说，GlacierDirectory屏蔽了：
+</p>
+
+<ul>
+  <li>文件存储的物理路径（<code>base_dir/RGIID[:8]/RGIID[:11]/RGIID/</code>）</li>
+  <li>文件名和扩展名（通过BASENAMES间接寻址）</li>
+  <li>数据格式（pickle vs shapefile vs NetCDF vs JSON）</li>
+  <li>压缩方式（gzip vs tar.gz vs uncompressed）</li>
+  <li>多情景的文件后缀（filesuffix）机制</li>
+  <li>任务状态日志的持久化</li>
+</ul>
+
+<span class="tag tag-beginner">入门</span>
+<div class="callout tip">
+  <div class="callout-title">类比：GlacierDirectory 如同冰川的"专属文件夹"</div>
+  <p>
+    想象每条冰川在磁盘上有一个自己的文件夹。GlacierDirectory就是这个文件夹的"管理员"——它知道每个文件应该放在哪里、叫什么名字，能帮你读取和写入，还能记录你在这个文件夹中的所有操作历史。你不需要关心硬盘上的实际路径是怎样的，只需要用逻辑名称（如 <code>'centerlines'</code>）说出你想要的文件即可。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>4.2 构造方式</h2>
+
+<p>
+GlacierDirectory提供了三种构造途径，满足不同的使用场景：
+</p>
+
+<h3>4.2.1 从RGI GeoSeries创建（全新冰川）</h3>
+<p>
+这是最常用的方式，用于从未被处理过的冰川开始：
+</p>
+
+<pre><code><span class="cmt"># 典型用法（gis.py 中 init_glacier_directories 任务相关）</span>
+<span class="kw">import</span> oggm
+
+<span class="cmt"># rgi_df 是一个 GeoDataFrame，每行为一条冰川</span>
+<span class="cmt"># entity 是其中一行（GeoSeries）</span>
+gdir = oggm.GlacierDirectory(entity, <span class="dec">base_dir</span>=<span class="str">'/data/oggm/per_glacier/'</span>,
+                              <span class="dec">reset</span>=<span class="kw">True</span>, <span class="dec">from_tar</span>=<span class="kw">False</span>)</code></pre>
+
+<p>
+构造函数签名（约第2643行）：
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">GlacierDirectory</span>(<span class="kw">object</span>):
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="dec">self</span>, <span class="dec">entity</span>, <span class="dec">base_dir</span>=<span class="kw">None</span>, <span class="dec">reset</span>=<span class="kw">False</span>,
+                 <span class="dec">from_tar</span>=<span class="kw">False</span>, <span class="dec">delete_tar</span>=<span class="kw">True</span>):
+        <span class="cmt"># entity 可以是:
+        #   (1) GeoSeries — 从 RGI GeoDataFrame 中迭代的行
+        #   (2) str — 已有的 RGI ID (用于恢复已有目录)</span></code></pre>
+
+<p>
+当 <code>entity</code> 是GeoSeries时，构造函数从中提取RGI ID、几何（geometry）、名称、所属区域等信息，然后构建目录路径。<code>reset=True</code> 会清空已有目录中的所有文件，从头开始。
+</p>
+
+<h3>4.2.2 从已有RGI ID恢复（已处理冰川）</h3>
+
+<pre><code><span class="cmt"># 恢复已处理过的冰川目录（GlacierDirectory）</span>
+gdir = oggm.GlacierDirectory(<span class="str">'RGI60-11.00001'</span>,
+                              <span class="dec">base_dir</span>=<span class="str">'/data/oggm/per_glacier/'</span>)</code></pre>
+
+<p>
+当 <code>entity</code> 是字符串时，构造函数假设目录已经存在，直接进入现有目录。构造函数会验证目录和必要的元数据文件是否存在。这是运行后续处理步骤（如气候插值或动力学模拟）时的典型入口。
+</p>
+
+<h3>4.2.3 从tar归档创建（传输/共享）</h3>
+
+<pre><code><span class="cmt"># 从tar归档解压并创建</span>
+gdir = oggm.GlacierDirectory(<span class="str">'RGI60-11.00001'</span>,
+                              <span class="dec">base_dir</span>=<span class="str">'/data/oggm/per_glacier/'</span>,
+                              <span class="dec">from_tar</span>=<span class="kw">True</span>)</code></pre>
+
+<p>
+<code>from_tar=True</code> 指示构造函数查找 <code>RGI60-11.00001.tar</code> 归档文件并解压到目标目录。这在以下场景中很有用：
+</p>
+<ul>
+  <li>从服务器下载预处理的冰川数据包</li>
+  <li>在不同计算节点之间传输冰川数据</li>
+  <li>归档已完成处理的结果</li>
+</ul>
+
+<p>
+<code>delete_tar=True</code>（默认）在成功解压后删除tar文件以节省磁盘空间。
+</p>
+
+<!-- ================================================================== -->
+<h2>4.3 目录结构</h2>
+
+<p>
+GlacierDirectory在磁盘上使用两级子目录分片（sharding）来避免单个目录下存放过多文件（可能导致文件系统性能下降）：
+</p>
+
+<pre><code>base_dir/
+  └── RGI60-11/               # RGI 区域前缀 (RGI ID 的前8个字符)
+        └── 00/               # 子分片 (RGI ID 的前11个字符的最后2位)
+              └── RGI60-11.00001/  # 完整的 RGI ID
+                    ├── glacier_grid.json
+                    ├── centerlines.pkl
+                    ├── ...
+                    └── task_status.json</code></pre>
+
+<p>
+具体规则：
+</p>
+<ul>
+  <li><strong>第一级路径：</strong><code>RGI ID[:8]</code> — 例如 <code>RGI60-11</code>（前8个字符，通常包含区域前缀）</li>
+  <li><strong>第二级路径：</strong><code>RGI ID[:11]</code> 的最后两位 — 例如 <code>00</code>（来自 <code>RGI60-11.00</code> 的 <code>00</code>）</li>
+  <li><strong>第三级路径：</strong>完整的RGI ID — 例如 <code>RGI60-11.00001</code></li>
+</ul>
+
+<p>
+这种分片策略确保即使处理RGI全部约20万条冰川，每个目录下也不会包含超过约200个子目录，从而维持文件系统的高效性。
+</p>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">RGI版本与目录结构的兼容性</div>
+  <p>
+    RGI ID的格式在RGI 6.0和RGI 7.0之间略有差异。RGI 6.0使用 <code>RGI60-X.XXXXX</code> 格式（5位数字），而RGI 7.0使用 <code>RGI2000-v7.0-G-XXXXXXX</code> 格式。OGGM v1.6同时支持这两种格式，但你的 <code>base_dir</code> 中会包含两种不同结构的路径。确保在使用 <code>initialize()</code> 时指定正确的RGI版本，以便目录结构正确分区。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>4.4 关键属性</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>属性</th>
+      <th>类型</th>
+      <th>来源</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>gdir.rgi_id</code></td>
+      <td>str</td>
+      <td>RGI ID</td>
+      <td>冰川的RGI唯一标识符，如 <code>'RGI60-11.00001'</code></td>
+    </tr>
+    <tr>
+      <td><code>gdir.rgi_area_km2</code></td>
+      <td>float</td>
+      <td>RGI属性 <code>Area</code></td>
+      <td>冰川面积（平方公里），用于多项参数化</td>
+    </tr>
+    <tr>
+      <td><code>gdir.cenlon</code></td>
+      <td>float</td>
+      <td>几何质心</td>
+      <td>冰川质心经度（度），用于气候数据插值</td>
+    </tr>
+    <tr>
+      <td><code>gdir.cenlat</code></td>
+      <td>float</td>
+      <td>几何质心</td>
+      <td>冰川质心纬度（度）</td>
+    </tr>
+    <tr>
+      <td><code>gdir.grid</code></td>
+      <td>salem.Grid</td>
+      <td><code>glacier_grid.json</code></td>
+      <td>本地投影网格对象（lazy-loaded）</td>
+    </tr>
+    <tr>
+      <td><code>gdir.intersects_ids</code></td>
+      <td>list[str]</td>
+      <td>RGI空间查询</td>
+      <td>与当前冰川缓冲区相交的相邻冰川ID列表</td>
+    </tr>
+    <tr>
+      <td><code>gdir.dir</code></td>
+      <td>str/pathlib.Path</td>
+      <td>构造函数</td>
+      <td>冰川目录（GlacierDirectory）的完整路径</td>
+    </tr>
+    <tr>
+      <td><code>gdir.rgi_region</code></td>
+      <td>str</td>
+      <td>RGI属性</td>
+      <td>RGI区域代码（如 <code>'11'</code> 用于中欧）</td>
+    </tr>
+    <tr>
+      <td><code>gdir.rgi_version</code></td>
+      <td>str</td>
+      <td>RGI属性</td>
+      <td>RGI版本（如 <code>'60'</code>）</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+<code>grid</code> 属性值得特别说明。它是一个延迟加载（lazy-loaded）属性——只有在第一次访问时才会从磁盘读取 <code>glacier_grid.json</code>。数据库使用 <code>salem.Grid</code> 对象（salem是OGGM团队维护的另一个开源库），提供投影感知的网格操作：
+</p>
+
+<pre><code><span class="cmt"># grid 属性的内部实现（简化版）</span>
+<span class="kw">@property</span>
+<span class="kw">def</span> <span class="fn">grid</span>(<span class="dec">self</span>):
+    <span class="kw">if</span> <span class="dec">self</span>._grid <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">with</span> <span class="kw">open</span>(<span class="dec">self</span>.get_filepath(<span class="str">'glacier_grid'</span>)) <span class="kw">as</span> f:
+            <span class="dec">self</span>._grid = salem.Grid.from_json(f.read())
+    <span class="kw">return</span> <span class="dec">self</span>._grid</code></pre>
+
+<!-- ================================================================== -->
+<h2>4.5 文件I/O方法</h2>
+
+<p>
+GlacierDirectory提供了一套统一的文件I/O接口，所有接口都遵循"先通过BASENAMES解析文件名，再进行I/O操作"的模式。
+</p>
+
+<h3>4.5.1 get_filepath() — 文件路径解析</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_filepath</span>(<span class="dec">self</span>, <span class="dec">filename</span>, <span class="dec">filesuffix</span>=<span class="str">''</span>,
+                     <span class="dec">check_exists</span>=<span class="kw">False</span>):
+    <span class="cmt"># filename 是 BASENAMES 中的逻辑名</span>
+    <span class="cmt"># 例如 'centerlines' → 解析 'centerlines' 后获得物理文件名</span>
+    <span class="cmt"># 然后拼接 dir / (物理文件名 + filesuffix)</span>
+    <span class="cmt"># 例如 dir / 'centerlines_rcp85.pkl'</span></code></pre>
+
+<p>
+<code>filesuffix</code> 参数（默认为 <code>cfg.PARAMS['filesuffix']</code>）会自动追加到文件基名和扩展名之间。例如 <code>get_filepath('centerlines', filesuffix='_rcp85')</code> 返回 <code>.../RGI60-11.00001/centerlines_rcp85.pkl</code>。
+</p>
+
+<h3>4.5.2 read_pickle() / write_pickle() — 压缩序列化</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">write_pickle</span>(<span class="dec">self</span>, <span class="dec">obj</span>, <span class="dec">filename</span>):
+    <span class="cmt"># 使用 gzip + pickle 序列化对象</span>
+    <span class="cmt"># 如果 cfg.PARAMS['use_compression'] 为 True（默认），使用 gzip 压缩</span>
+    <span class="kw">with</span> gzip.open(filepath, <span class="str">'wb'</span>) <span class="kw">as</span> f:
+        pickle.dump(obj, f, <span class="dec">protocol</span>=pickle.HIGHEST_PROTOCOL)
+
+<span class="kw">def</span> <span class="fn">read_pickle</span>(<span class="dec">self</span>, <span class="dec">filename</span>, <span class="dec">use_compression</span>=<span class="kw">None</span>):
+    <span class="cmt"># 从 gzip 压缩的 pickle 文件反序列化</span>
+    <span class="kw">with</span> gzip.open(filepath, <span class="str">'rb'</span>) <span class="kw">as</span> f:
+        <span class="kw">return</span> pickle.load(f)</code></pre>
+
+<p>
+压缩可以显著减少磁盘空间——冰厚度反演后的flowline数据可达数MB每条冰川，压缩后可减小到约20%。
+</p>
+
+<h3>4.5.3 read_shapefile() / write_shapefile() — 地理空间I/O</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">write_shapefile</span>(<span class="dec">self</span>, <span class="dec">shp</span>, <span class="dec">filename</span>, <span class="dec">tar</span>=<span class="kw">False</span>):
+    <span class="cmt"># shp: geopandas GeoDataFrame 或 fiona 兼容对象</span>
+    <span class="cmt"># tar=False: 写入 .shp + .dbf + .shx + ... 文件套件</span>
+    <span class="cmt"># tar=True:  将所有文件打包为 .tar.gz 存档</span>
+
+<span class="kw">def</span> <span class="fn">read_shapefile</span>(<span class="dec">self</span>, <span class="dec">filename</span>, <span class="dec">tar</span>=<span class="kw">False</span>):
+    <span class="cmt"># tar=False: 从 .shp + 套件读取</span>
+    <span class="cmt"># tar=True:  从 .tar.gz 存档读取</span>
+    <span class="kw">return</span> geopandas.read_file(path)</code></pre>
+
+<p>
+tar选项特别适合空间索引（如 <code>intersects</code> 输出），因为它们由多个文件组成（.shp, .dbf, .shx, .prj 等）。
+</p>
+
+<h3>4.5.4 read_json() / write_json() — 元数据I/O</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">write_json</span>(<span class="dec">self</span>, <span class="dec">data</span>, <span class="dec">filename</span>):
+    <span class="kw">with</span> <span class="kw">open</span>(filepath, <span class="str">'w'</span>) <span class="kw">as</span> f:
+        json.dump(data, f, <span class="dec">indent</span>=<span class="num">2</span>)
+
+<span class="kw">def</span> <span class="fn">read_json</span>(<span class="dec">self</span>, <span class="dec">filename</span>):
+    <span class="kw">with</span> <span class="kw">open</span>(filepath, <span class="str">'r'</span>) <span class="kw">as</span> f:
+        <span class="kw">return</span> json.load(f)</code></pre>
+
+<p>
+主要用于存储轻量级元数据：<code>glacier_grid.json</code>（网格定义）、<code>local_mustar.json</code>（温度敏感性参数）、<code>dem_source.json</code>（DEM来源信息）等。
+</p>
+
+<h3>4.5.5 has_file() — 存在性检查</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">has_file</span>(<span class="dec">self</span>, <span class="dec">filename</span>):
+    <span class="cmt"># 检查文件是否存在（支持tar shapefile的特殊处理）</span>
+    <span class="cmt"># 如果是 shapefile 类型，检查 .tar.gz 或 .shp</span>
+    <span class="cmt"># 如果是其他类型，检查 .pkl 或 .nc 等</span></code></pre>
+
+<p>
+此方法是 <code>entity_task</code> 自动跳过逻辑的底层支撑。每个entity_task的writes_output列表中的文件都会通过 <code>gdir.has_file()</code> 检查其存在性。
+</p>
+
+<h3>4.5.6 write_monthly_climate_file() — NetCDF气候数据</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">write_monthly_climate_file</span>(<span class="dec">self</span>, <span class="dec">time</span>, <span class="dec">prcp</span>, <span class="dec">temp</span>,
+                                 <span class="dec">gradient</span>, <span class="dec">ref_pix_lon</span>, <span class="dec">ref_pix_lat</span>,
+                                 <span class="dec">filename</span>, <span class="dec">source</span>=<span class="str">''</span>):
+    <span class="cmt"># 创建包含时间、降水、温度、温度梯度的NetCDF4文件</span>
+    <span class="cmt"># 同时写入参考像素坐标和气候数据来源元数据</span>
+    <span class="cmt"># 文件结构符合OGGM的climate_data约定</span></code></pre>
+
+<p>
+此方法专门用于创建OGGM标准格式的气候文件（<code>climate_historical.nc</code> 和 <code>gcm_data.nc</code>）。它使用 <code>netCDF4</code> 库创建包含以下变量的文件：
+</p>
+<ul>
+  <li><code>temp</code>：月平均温度 (degC)</li>
+  <li><code>prcp</code>：月总降水量 (kg m^{-2} month^{-1})</li>
+  <li><code>gradient</code>：月温度梯度 (K km^{-1})</li>
+  <li><code>ref_pix_lon</code>, <code>ref_pix_lat</code>：参考像素坐标</li>
+  <li>全局属性：<code>source</code>（气候数据来源）</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>4.6 任务状态系统</h2>
+
+<p>
+GlacierDirectory维护一个 <code>task_status.json</code> 日志文件，记录所有entity_task的执行历史。这是OGGM自动跳过（auto-skip）和错误恢复（error recovery）机制的基石。
+</p>
+
+<h3>4.6.1 get_task_status()</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_task_status</span>(<span class="dec">self</span>, <span class="dec">task_name</span>=<span class="kw">None</span>):
+    <span class="cmt"># 返回指定任务的状态:
+    #   'success'  — 任务成功完成
+    #   'skipped'  — 任务已跳过（输出文件已存在）
+    #   'error'    — 任务执行出错
+    #   None       — 任务尚未执行
+    <span class="cmt"># task_name=None 时返回所有任务的状态字典</span></code></pre>
+
+<p>
+task_status.json 文件的内部结构：
+</p>
+
+<pre><code>{
+  <span class="str">"compute_centerlines"</span>: {
+    <span class="str">"status"</span>: <span class="str">"success"</span>,
+    <span class="str">"start_time"</span>: <span class="str">"2024-01-15 10:23:45"</span>,
+    <span class="str">"end_time"</span>: <span class="str">"2024-01-15 10:23:58"</span>,
+    <span class="str">"duration_seconds"</span>: <span class="num">13.2</span>,
+    <span class="str">"base_version"</span>: <span class="str">"1.6.3"</span>
+  },
+  <span class="str">"prepare_climate"</span>: {
+    <span class="str">"status"</span>: <span class="str">"error"</span>,
+    <span class="str">"start_time"</span>: <span class="str">"2024-01-15 10:24:00"</span>,
+    <span class="str">"end_time"</span>: <span class="str">"2024-01-15 10:24:02"</span>,
+    <span class="str">"error_traceback"</span>: <span class="str">"..."</span>
+  }
+}</code></pre>
+
+<h3>4.6.2 get_task_time()</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_task_time</span>(<span class="dec">self</span>, <span class="dec">task_name</span>):
+    <span class="cmt"># 返回任务执行的开始/结束时间 (datetime对象)
+    <span class="cmt"># 用于判断输出文件的新鲜度</span></code></pre>
+
+<h3>4.6.3 get_error_log()</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_error_log</span>(<span class="dec">self</span>):
+    <span class="cmt"># 返回所有状态为 'error' 的任务的错误信息
+    <span class="cmt"># 适用于自动化错误报告和调试</span></code></pre>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout">
+  <div class="callout-title">设计洞察：任务状态系统的价值</div>
+  <p>
+    任务状态系统看似简单，但它是OGGM能够可靠处理数万条冰川的关键设计。在没有任何任务状态系统的情况下，并行处理的中断会导致灾难性后果：你需要手动检查每一条冰川的文件是否完整，然后从断点重新开始。有了task_status，<code>execute_entity_task()</code> 在重启时自动跳过所有已完成（status='success'）的冰川，仅重新处理失败的（status='error'）和未开始的（status=None）。这为故障恢复提供了零成本的重启能力。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>4.7 气候参考数据管理</h2>
+
+<p>
+GlacierDirectory包含了专门用于管理物质平衡校准所需的气候参考数据的方法：
+</p>
+
+<h3>4.7.1 set_ref_mb_data()</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">set_ref_mb_data</span>(<span class="dec">self</span>, <span class="dec">ref_mb_df</span>):
+    <span class="cmt"># 设置参考物质平衡数据 (GeoDataFrame)
+    <span class="cmt"># ref_mb_df 包含知道物质平衡的冰川的测量数据
+    <span class="cmt"># 数据存储在 self._ref_mb_df 属性中</span></code></pre>
+
+<p>
+参考物质平衡数据来源于全球冰川监测服务（WGMS）的测量数据库，仅覆盖全球约500条冰川。在校准过程中，这些数据用于确定每条冰川（包括未被直接测量的）的温度敏感性参数 <code>mu_star</code>。
+</p>
+
+<h3>4.7.2 get_ref_mb_data()</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_ref_mb_data</span>(<span class="dec">self</span>):
+    <span class="cmt"># 返回参考物质平衡数据
+    <span class="cmt"># 如果在当前区域找不到参考冰川，可能启动二级搜索</span></code></pre>
+
+<h3>4.7.3 get_ref_mb_profile()</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_ref_mb_profile</span>(<span class="dec">self</span>):
+    <span class="cmt"># 返回参考物质平衡随高度变化的梯度曲线
+    <span class="cmt"># 这是校准 mu_star 的关键输入</span></code></pre>
+
+<h3>4.7.4 get_climate_info()</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_climate_info</span>(<span class="dec">self</span>):
+    <span class="cmt"># 返回气候数据的元信息：
+    <span class="cmt"># - 参考像素坐标 (经纬度)
+    <span class="cmt"># - 气候数据源和覆盖时间段
+    <span class="cmt"># - 是否从GCM数据中进行了时间偏移</span></code></pre>
+
+<p>
+这些方法体现了GlacierDirectory不仅管理文件I/O，还管理数据的"上下文"——知道哪里获取参考冰川数据、如何校准参数，以及操作这些数据所需的元信息。
+</p>
+
+<!-- ================================================================== -->
+<h2>4.8 投影处理：UTM vs Transverse Mercator</h2>
+
+<p>
+GlacierDirectory管理地图投影的配置和转换：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">_reproject_and_write_shapefile</span>(<span class="dec">self</span>, <span class="dec">in_shp</span>, <span class="dec">out_filename</span>,
+                                     <span class="dec">map_proj</span>=<span class="kw">None</span>):
+    <span class="cmt"># 将输入shapefile重投影为目标投影并写出
+    <span class="cmt"># 支持 cfg.PARAMS['map_proj'] 中的两种投影:
+    <span class="cmt">#   'tmerc' (横轴墨卡托) — 距离保持，适合高纬度
+    <span class="cmt">#   'utm'   (通用横轴墨卡托) — 标准UTM分带</span></code></pre>
+
+<p>
+OGGM默认使用横轴墨卡托（Transverse Mercator, tmerc）投影，以冰川质心为中心，因为它在局部区域内能很好地保持距离和方向。对于极地地区的冰川，UTM投影可能失效（UTM在84N以上和80S以下未定义），此时横轴墨卡托是更好的选择。
+</p>
+
+<p>
+投影选择对计算精度有直接影响：
+</p>
+<ul>
+  <li><strong>tmerc（默认）：</strong>为每条冰川单独设置投影中心，确保局部变形最小。适合工作流中的距离测量（如grid_dx计算）。</li>
+  <li><strong>aea（Albers等面积）：</strong>保持面积不变，适合面积相关计算。</li>
+  <li><strong>utm：</strong>使用标准UTM带，适合区域展示。在极地地区自动回退到tmerc。</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>4.9 文件生命周期：各prepro级别的产出</h2>
+
+<p>
+以下是OGGM预处理管线各层级（prepro level）在GlacierDirectory中创建的文件清单：
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Prepro Level</th>
+      <th>实体任务（entity task）</th>
+      <th>创建的输出文件</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Level 0</td>
+      <td><code>define_glacier_region</code></td>
+      <td><code>glacier_grid.json</code>, <code>dem_source.json</code></td>
+    </tr>
+    <tr>
+      <td>Level 1</td>
+      <td><code>compute_centerlines</code></td>
+      <td><code>centerlines.pkl</code>, <code>downstream_line.pkl</code>, <code>flowline_catchments.pkl</code>, <code>hypsometry.csv</code></td>
+    </tr>
+    <tr>
+      <td>Level 2</td>
+      <td><code>process_climate_data</code></td>
+      <td><code>climate_historical.nc</code>, <code>gcm_data.nc</code> (if GCM data available)</td>
+    </tr>
+    <tr>
+      <td>Level 3</td>
+      <td><code>local_t_star</code></td>
+      <td><code>ref_tstars.csv</code>, <code>local_mustar.json</code></td>
+    </tr>
+    <tr>
+      <td>Level 4</td>
+      <td><code>prepare_for_inversion</code></td>
+      <td><code>inversion_input.pkl</code></td>
+    </tr>
+    <tr>
+      <td>Level 5</td>
+      <td><code>volume_inversion</code></td>
+      <td><code>inversion_output.pkl</code>, <code>inversion_flowlines.pkl</code></td>
+    </tr>
+    <tr>
+      <td>Level 6</td>
+      <td><code>init_present_time_glacier</code></td>
+      <td><code>model_geometry.nc</code>, <code>model_diagnostics.nc</code> (initial state)</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+<strong>重要约定：</strong>较低级别必须在其所有上级文件完整存在的基础上运行。例如，不能在没有完成Level 3（<code>local_mustar.json</code>存在）的情况下运行Level 4（<code>prepare_for_inversion</code>）。entity_task的自动跳过机制通过检查 <code>writes_output</code> 中列出的所有文件来强制执行这层约定。
+</p>
+
+<span class="tag tag-advanced">专家</span>
+<div class="callout expert">
+  <div class="callout-title">自定义prepro管线</div>
+  <p>
+    预定义的prepro levels是OGGM对标准使用场景的封装。如果你需要插入自定义步骤（例如在centerlines和climate之间加入一个遥感冰川速度的步骤），你可以：
+  </p>
+  <ol>
+    <li>创建一个新的 <code>@entity_task</code> 函数，指定 <code>writes_output</code> 参数</li>
+    <li>在 <code>BASENAMES</code> 中注册你的新输出文件类型</li>
+    <li>将你的任务插入到合适的prepro level之间</li>
+  </ol>
+  <p>
+    关键约束是：你的任务的 <code>writes_output</code> 中必须列出所有你会创建的文件，这样自动跳过逻辑才能正确工作。如果遗漏，后续重新运行时会误判你的任务需要重新执行。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>4.10 filesuffix 机制：多情景实验的基石</h2>
+
+<p>
+<code>filesuffix</code> 是OGGM支持在单一工作目录下运行多个气候/参数情景的关键设计：
+</p>
+
+<pre><code><span class="cmt"># 场景1: RCP 8.5 (高排放)</span>
+cfg.PARAMS[<span class="str">'filesuffix'</span>] = <span class="str">'_rcp85'</span>
+workflow.execute_entity_task(tasks.run_random_climate, gdirs, ...)
+<span class="cmt"># 输出: model_geometry_rcp85.nc, model_diagnostics_rcp85.nc</span>
+
+<span class="cmt"># 场景2: RCP 2.6 (低排放)</span>
+cfg.PARAMS[<span class="str">'filesuffix'</span>] = <span class="str">'_rcp26'</span>
+workflow.execute_entity_task(tasks.run_random_climate, gdirs, ...)
+<span class="cmt"># 输出: model_geometry_rcp26.nc, model_diagnostics_rcp26.nc</span></code></pre>
+
+<p>
+实现方式是：GlacierDirectory的所有I/O方法内部调用 <code>get_filepath()</code> 时，自动从 <code>cfg.PARAMS['filesuffix']</code> 读取后缀并拼接。这意味着你不需要修改任何任务代码，只需在运行不同情景前更改配置即可。
+</p>
+
+<p>
+工作原理（简化版源码）：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">get_filepath</span>(<span class="dec">self</span>, <span class="dec">filename</span>, <span class="dec">filesuffix</span>=<span class="kw">None</span>):
+    <span class="kw">if</span> filesuffix <span class="kw">is</span> <span class="kw">None</span>:
+        filesuffix = cfg.PARAMS.get(<span class="str">'filesuffix'</span>, <span class="str">''</span>)
+
+    <span class="cmt"># 从 BASENAMES 获取物理文件名</span>
+    base_name = cfg.BASENAMES[filename]
+
+    <span class="cmt"># 插入 filesuffix（在基名和扩展名之间）</span>
+    stem, ext = os.path.splitext(base_name)
+    if filesuffix:
+        actual_name = <span class="str">f"{stem}{filesuffix}{ext}"</span>
+    else:
+        actual_name = base_name
+
+    <span class="kw">return</span> os.path.join(<span class="dec">self</span>.dir, actual_name)</code></pre>
+
+<div class="callout tip">
+  <div class="callout-title">filesuffix 最佳实践</div>
+  <p>
+    (1) 使用描述性的后缀名：<code>'_rcp85'</code>比 <code>'_v2'</code> 更好。<br>
+    (2) 后缀通常以 <code>'_'</code> 开头以避免与基本文件名混淆。<br>
+    (3) 你的自定义 <code>@entity_task</code> 应该使用 <code>gdir.get_filepath()</code> 而非手动拼接文件名，以自动享受filesuffix支持。<br>
+    (4) 在分析脚本中，使用相同的filesuffix从各种文件中一致地读取数据：<code>gdir.read_pickle('model_geometry', filesuffix='_rcp85')</code>。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>4.11 GlacierDirectory 类的关键代码量分布</h2>
+
+<p>
+以下是GlacierDirectory类（约1300行）的功能分解：
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>功能区域</th>
+      <th>大致行数</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>构造函数和属性</td>
+      <td>~200</td>
+      <td>__init__, grid, rgi_id, 等基础属性</td>
+    </tr>
+    <tr>
+      <td>文件路径和I/O</td>
+      <td>~400</td>
+      <td>get_filepath, read/write_pickle/shapefile/json/nc</td>
+    </tr>
+    <tr>
+      <td>任务状态系统</td>
+      <td>~150</td>
+      <td>task_status读写、错误日志</td>
+    </tr>
+    <tr>
+      <td>气候和管理</td>
+      <td>~250</td>
+      <td>set/get_ref_mb_data, climate_info, monthly_climate</td>
+    </tr>
+    <tr>
+      <td>GIS和投影</td>
+      <td>~150</td>
+      <td>_reproject_and_write_shapefile, grid属性</td>
+    </tr>
+    <tr>
+      <td>辅助方法</td>
+      <td>~150</td>
+      <td>reset_directory, intersects, 等各种工具</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>4.12 总结</h2>
+
+<p>
+GlacierDirectory是OGGM中"关注点分离"原则的典范：
+</p>
+
+<ul>
+  <li><strong>对 core 模块透明：</strong>core中的科学代码不需要关心文件存储在何处、如何压缩、采用什么命名——只需要调用 <code>gdir.read_pickle('centerlines')</code></li>
+  <li><strong>对用户透明：</strong>用户不需要手动管理文件路径——filesuffix机制允许无缝的多情景切换</li>
+  <li><strong>对并行透明：</strong>每条冰川的独立目录使其天然适合多进程处理</li>
+  <li><strong>对扩展透明：</strong>BASENAMES允许shop模块在无需修改GlacierDirectory代码的情况下注册新的文件类型</li>
+</ul>
+
+<p>
+在后续章节中，每当看到 <code>gdir.read_xxx()</code> 或 <code>gdir.write_xxx()</code> 调用时，请记住本章的内容——这些简洁的接口背后是OGGM精心设计的文件管理架构。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch03.html">第3章：配置系统深度解析</a></span>
+  <span style="visibility:hidden" class="next"><a href="#">下一章</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源模型技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

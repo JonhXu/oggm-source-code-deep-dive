@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>附录C 文件格式参考 — OGGM 源码深度解析</title>
+<style>
+:root {
+  --bg: #fffdf8; --fg: #1a1a1a; --accent: #2c5f8a; --accent-light: #e8f0f7;
+  --code-bg: #f4f4f4; --border: #ddd;
+}
+body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg); line-height: 1.7; }
+h1 { font-size: 2rem; color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: .4rem; margin-top: 2.5rem; }
+h2 { font-size: 1.55rem; color: #1e4a6b; border-bottom: 2px solid #c8d8e8; padding-bottom: .25rem; margin-top: 2.2rem; }
+h3 { font-size: 1.25rem; color: #2c5f8a; margin-top: 1.6rem; }
+h4 { font-size: 1.1rem; color: #444; margin-top: 1.2rem; }
+p { margin: .8rem 0; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: .9rem; line-height: 1.5; }
+code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88em; background: #eee; padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+thead { background: var(--accent); color: #fff; }
+th, td { padding: .5rem .6rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+tbody tr:nth-child(even) { background: #f9f9f9; }
+.chapter-nav { display: flex; justify-content: space-between; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.chapter-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.file-card { border: 1px solid var(--border); border-radius: 6px; padding: 1rem; margin: 1rem 0; background: #fdfdfd; }
+.file-card h4 { margin-top: 0; color: var(--accent); }
+.file-card .meta { font-size: .88em; color: #666; margin-bottom: .5rem; }
+footer { text-align: center; color: #888; font-size: .85rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<h1>附录C 文件格式参考</h1>
+
+<p>
+每个 OGGM 冰川目录（GlacierDirectory）包含一组由预处理、气候、反演和模拟工作流生成的标准化文件。
+本附录记录了每个文件的用途、格式、内部结构以及变量/键清单。
+在读取、写入或调试冰川目录（GlacierDirectory）内容时，请使用此参考。
+</p>
+
+<div class="callout tip" style="background:#e8f0f7;border-left:5px solid #2c5f8a;padding:.75rem 1rem;border-radius:6px;margin:1rem 0;">
+<span style="font-weight:700;">按研究问题查文件</span>
+<table>
+<thead><tr><th>研究问题</th><th>优先读取</th><th>核心变量或键</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td>冰川面积、长度、体积时间序列</td><td><code>model_diagnostics.nc</code></td><td><code>area_m2</code>, <code>length_m</code>, <code>volume_m3</code></td><td>用于历史模拟、未来情景和区域统计。</td></tr>
+<tr><td>初始冰厚和冰储量</td><td><code>inversion_output.pkl</code></td><td><code>volume</code>, <code>thick</code>/<code>thickness</code></td><td>反演结果，不等同于直接观测。</td></tr>
+<tr><td>物质平衡校准</td><td><code>mb_calib.json</code></td><td><code>melt_f</code>, <code>temp_bias</code>, <code>prcp_fac</code></td><td>解释不同冰川响应差异时必须检查。</td></tr>
+<tr><td>气候输入</td><td><code>climate_historical.nc</code></td><td><code>temp</code>, <code>prcp</code>, <code>ref_hgt</code></td><td>降水是月总量，不是瞬时速率。</td></tr>
+<tr><td>质量控制和溯源</td><td><code>diagnostics.json</code></td><td><code>dem_source</code>, 任务诊断键</td><td>区域批处理后应首先汇总。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>C.1 冰川目录（GlacierDirectory）文件清单</h2>
+
+<table>
+<thead><tr><th>文件名</th><th>BASENAMES 键</th><th>格式</th><th>生成来源</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td>outlines.shp</td><td>outlines</td><td>ESRI Shapefile</td><td>init_glacier_directories</td><td>所有任务</td></tr>
+<tr><td>dem.tif</td><td>dem</td><td>GeoTIFF</td><td>process_dem</td><td>GIS 任务</td></tr>
+<tr><td>glacier_grid.json</td><td>glacier_grid</td><td>JSON</td><td>define_glacier_region</td><td>初始化之后的所有任务</td></tr>
+<tr><td>gridded_data.nc</td><td>gridded_data</td><td>NetCDF</td><td>glacier_masks, gridded_attributes, catchment_area</td><td>中心线、反演</td></tr>
+<tr><td>climate_historical.nc</td><td>climate_historical</td><td>NetCDF</td><td>process_climate_data</td><td>物质平衡、校准</td></tr>
+<tr><td>centerlines.pkl</td><td>centerlines</td><td>gzip pickle</td><td>compute_centerlines</td><td>流线初始化</td></tr>
+<tr><td>inversion_input.pkl</td><td>inversion_input</td><td>pickle</td><td>prepare_for_inversion</td><td>反演</td></tr>
+<tr><td>inversion_output.pkl</td><td>inversion_output</td><td>pickle</td><td>mass_conservation_inversion</td><td>流线模型</td></tr>
+<tr><td>model_flowlines.pkl</td><td>model_flowlines</td><td>pickle</td><td>initialize_flowlines</td><td>反演、演化</td></tr>
+<tr><td>model_diagnostics.nc</td><td>model_diagnostics</td><td>NetCDF</td><td>flowline_model_run</td><td>后处理</td></tr>
+<tr><td>mb_calib.json</td><td>mb_calib</td><td>JSON</td><td>mb_calibration</td><td>物质平衡模型</td></tr>
+<tr><td>geometries.pkl</td><td>geometries</td><td>pickle</td><td>catchment_area</td><td>可视化</td></tr>
+<tr><td>hypsometry.csv</td><td>hypsometry</td><td>CSV</td><td>initialize_flowlines</td><td>体积-面积标度</td></tr>
+<tr><td>diagnostics.json</td><td>diagnostics</td><td>JSON</td><td>贯穿整个工作流</td><td>调试、溯源</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>C.2 逐文件规格说明</h2>
+<!-- ================================================================== -->
+
+<div class="file-card">
+<h4>outlines.shp -- RGI 冰川轮廓</h4>
+<div class="meta">格式: ESRI Shapefile | BASENAMES 键: <code>outlines</code></div>
+<p><strong>用途:</strong> 包含冰川轮廓多边形和 RGI 元数据。这是所有其他数据的起始来源。</p>
+<p><strong>字段:</strong></p>
+<table>
+<thead><tr><th>字段</th><th>类型</th><th>描述</th></tr></thead>
+<tbody>
+<tr><td><code>RGIId</code></td><td>str（14 字符）</td><td>唯一的 RGI 冰川标识符</td></tr>
+<tr><td><code>GLIMSId</code></td><td>str</td><td>GLIMS 冰川标识符</td></tr>
+<tr><td><code>Name</code></td><td>str</td><td>冰川名称（如果已知）</td></tr>
+<tr><td><code>Area</code></td><td>float</td><td>RGI 报告的面积（km²）</td></tr>
+<tr><td><code>CenLat</code></td><td>float</td><td>质心纬度（度）</td></tr>
+<tr><td><code>CenLon</code></td><td>float</td><td>质心经度（度）</td></tr>
+<tr><td><code>TermType</code></td><td>int</td><td>末端类型代码（0=陆地，1=海洋，2=湖泊等）</td></tr>
+<tr><td><code>Connect</code></td><td>int</td><td>连通性代码</td></tr>
+<tr><td><code>Status</code></td><td>int</td><td>冰川状态代码</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="file-card">
+<h4>dem.tif -- 数字高程模型</h4>
+<div class="meta">格式: GeoTIFF（Float32） | BASENAMES 键: <code>dem</code></div>
+<p><strong>用途:</strong> 经过重投影和裁剪的 DEM，覆盖冰川及其缓冲区（即"边界"）。</p>
+<p><strong>属性:</strong> 单波段 Float32 栅格。使用投影坐标参考系（通常以冰川为中心的横轴墨卡托投影）。
+NoData 值：-9999。分辨率由参数中的 <code>grid_dx_method</code> 决定。</p>
+<p><strong>尺寸:</strong> 网格尺寸取决于冰川面积和边界。通常在 30-100 米分辨率下，每边 50-200 像素。</p>
+</div>
+
+<div class="file-card">
+<h4>glacier_grid.json -- Salem 网格定义</h4>
+<div class="meta">格式: JSON | BASENAMES 键: <code>glacier_grid</code></div>
+<p><strong>用途:</strong> 定义冰川的局部坐标系和网格。</p>
+<p><strong>结构:</strong></p>
+<pre><code>{
+  "proj": "+proj=tmerc +lat_0=46.80 +lon_0=10.78 +k=1.0 +x_0=0 +y_0=0 +ellps=WGS84",
+  "x0": 0,
+  "y0": 0,
+  "nx": 134,
+  "ny": 107,
+  "dx": 100.0,
+  "dy": 100.0,
+  "origin": "lower-left",
+  "pixel_ref": "corner",
+  "topo_valid": true
+}</code></pre>
+<p><strong>关键字段:</strong> <code>proj</code>（PROJ.4 字符串），<code>dx</code>/<code>dy</code>（网格间距，单位米），
+<code>nx</code>/<code>ny</code>（x 和 y 方向的网格单元数）。</p>
+</div>
+
+<div class="file-card">
+<h4>gridded_data.nc -- 网格化变量</h4>
+<div class="meta">格式: NetCDF4 | BASENAMES 键: <code>gridded_data</code></div>
+<p><strong>用途:</strong> 所有 2D 网格化数据的中央存储库。随着预处理工作流的推进，变量会逐步添加。</p>
+<p><strong>维度:</strong> <code>(y, x)</code>，与 glacier_grid 维度匹配。</p>
+<p><strong>变量清单:</strong></p>
+<table>
+<thead><tr><th>变量</th><th>数据类型</th><th>单位</th><th>添加者</th><th>描述</th></tr></thead>
+<tbody>
+<tr><td><code>topo</code></td><td>float64</td><td>m a.s.l.</td><td>process_dem</td><td>完整 DEM 高程（包括冰川外地形）</td></tr>
+<tr><td><code>glacier_mask</code></td><td>uint8</td><td>布尔型（0/1）</td><td>glacier_masks</td><td>掩膜：1 = 冰川内，0 = 冰川外</td></tr>
+<tr><td><code>glacier_topo</code></td><td>float64</td><td>m a.s.l.</td><td>glacier_masks</td><td>被冰川区域掩膜后的 DEM（外部为 NaN）</td></tr>
+<tr><td><code>aspect</code></td><td>float64</td><td>度</td><td>gridded_attributes</td><td>地表坡向（0-360，0 = 北）</td></tr>
+<tr><td><code>slope</code></td><td>float64</td><td>度</td><td>gridded_attributes</td><td>地表坡度角</td></tr>
+<tr><td><code>dis</code></td><td>float64</td><td>m</td><td>gridded_attributes</td><td>每个网格单元到冰川轮廓的距离</td></tr>
+<tr><td><code>catchment_mask</code></td><td>uint8</td><td>类别</td><td>catchment_area</td><td>每个网格单元的流域 ID（0 表示无流域）</td></tr>
+<tr><td><code>distributed_thickness</code></td><td>float64</td><td>m</td><td>distribute_2d（sandbox 模块）</td><td>从流线分布得到的 2D 冰厚度</td></tr>
+</tbody>
+</table>
+<p><strong>全局属性:</strong> <code>rgi_id</code>、<code>dem_source</code>、<code>proj</code>、<code>grid_dx</code>、<code>grid_dy</code>。</p>
+</div>
+
+<div class="file-card">
+<h4>climate_historical.nc -- 气候时间序列</h4>
+<div class="meta">格式: NetCDF4 | BASENAMES 键: <code>climate_historical</code></div>
+<p><strong>用途:</strong> 存储冰川的月均温度和降水时间序列，从气候数据源插值到冰川的高程范围。</p>
+<p><strong>维度:</strong> <code>time</code>（逐月，通常从 1901 年至今），<code>height</code>（离散高程层）。</p>
+<p><strong>变量清单:</strong></p>
+<table>
+<thead><tr><th>变量</th><th>维度</th><th>单位</th><th>描述</th></tr></thead>
+<tbody>
+<tr><td><code>temp</code></td><td>(time, height)</td><td>deg C</td><td>各高程层的月平均温度</td></tr>
+<tr><td><code>prcp</code></td><td>(time, height)</td><td>kg m⁻²</td><td>各高程层的月总降水量</td></tr>
+<tr><td><code>gradient</code></td><td>(time)</td><td>deg C / 100m</td><td>月温度递减率</td></tr>
+<tr><td><code>ref_hgt</code></td><td>标量</td><td>m a.s.l.</td><td>原始气候数据的参考高程</td></tr>
+<tr><td><code>ref_pix_lat</code></td><td>标量</td><td>度</td><td>参考气候像素的纬度</td></tr>
+<tr><td><code>ref_pix_lon</code></td><td>标量</td><td>度</td><td>参考气候像素的经度</td></tr>
+<tr><td><code>ref_pix_dis</code></td><td>标量</td><td>km</td><td>冰川中心到参考像素的距离</td></tr>
+<tr><td><code>ref_pix_area</code></td><td>标量</td><td>m²</td><td>参考气候像素的面积</td></tr>
+</tbody>
+</table>
+<p><strong>时间覆盖范围:</strong> 起止日期取决于气候数据源。CRU TS 通常覆盖 1901 年至今（存在 1-2 年的滞后）。</p>
+<p><strong>高程层:</strong> 通常为 30 个离散层，覆盖从冰川最低点到最高点的高程范围，外加安全余量。</p>
+</div>
+
+<div class="file-card">
+<h4>centerlines.pkl -- 中心线对象</h4>
+<div class="meta">格式: gzip 压缩 pickle | BASENAMES 键: <code>centerlines</code></div>
+<p><strong>用途:</strong> 存储从冰川掩膜计算得到的几何中心线对象。</p>
+<p><strong>内容:</strong> 一个 <code>Centerline</code> 对象列表，每个对象包含：
+<code>line</code>（shapely LineString -- 投影坐标下的中心线几何），
+<code>dis_on_line</code>（ndarray -- 沿线距离，单位米），
+<code>heads</code>（Point 列表 -- 上游端点），
+<code>tail</code>（Point -- 下游末端点），
+<code>flows_to</code>（Centerline 或 None -- 该中心线汇入的下游中心线），
+<code>inflows</code>（Centerline 列表 -- 汇入该中心线的上游中心线），
+<code>order</code>（int -- 河流级别）。</p>
+</div>
+
+<div class="file-card">
+<h4>inversion_input.pkl -- 反演输入</h4>
+<div class="meta">格式: pickle | BASENAMES 键: <code>inversion_input</code></div>
+<p><strong>用途:</strong> 为质量守恒反演准备的数据。</p>
+<p><strong>内容:</strong> dict，包含以下键：
+<code>flux</code>（ndarray 列表 -- 每条流线的表观物质平衡（apparent mass balance）通量），
+<code>width</code>（ndarray 列表 -- 每个网格点处的流线宽度），
+<code>dx</code>（float -- 网格间距，单位米），
+<code>surface_h</code>（ndarray 列表 -- 每条流线的表面高程），
+<code>bed_h</code>（ndarray 列表 -- 每条流线的初始冰床估计），
+<code>glen_a</code>（float -- 反演使用的 Glen's A 参数），
+<code>fs</code>（float -- 反演使用的滑动参数）。</p>
+</div>
+
+<div class="file-card">
+<h4>inversion_output.pkl -- 反演结果</h4>
+<div class="meta">格式: pickle | BASENAMES 键: <code>inversion_output</code></div>
+<p><strong>用途:</strong> 质量守恒反演得到的冰厚度分布。</p>
+<p><strong>内容:</strong> dict，包含以下键：
+<code>volume</code>（float -- 冰川总体积，m³），
+<code>volume_bsl</code>（float -- 海平面以下体积，m³，用于入海型冰川），
+<code>volume_bsl_max</code>（float -- 最大可能的海平面以下体积），
+<code>thickness</code>（ndarray 列表 -- 每条流线的反演厚度，m），
+<code>is_tidewater</code>（bool -- 冰川末端是否到达海/湖），
+<code>bed_h</code>（ndarray 列表 -- 每条流线的最终冰床高程），
+<code>glen_a</code>（float -- 使用的 Glen's A 值），
+<code>fs</code>（float -- 使用的滑动参数）。</p>
+</div>
+
+<div class="file-card">
+<h4>model_flowlines.pkl -- MixedBedFlowline 对象</h4>
+<div class="meta">格式: pickle | BASENAMES 键: <code>model_flowlines</code></div>
+<p><strong>用途:</strong> 准备用于数值模拟的流线对象。包含模型网格分辨率下的完整几何信息（表面、反演后的冰床、宽度）。</p>
+<p><strong>内容:</strong> 一个 <code>MixedBedFlowline</code> 对象列表（<code>Flowline</code> 的子类），每个对象包含：
+<code>dis_on_line</code>（ndarray -- 沿流线距离，m），
+<code>surface_h</code>（ndarray -- 来自 DEM 的表面高程，m），
+<code>bed_h</code>（ndarray -- 来自反演或初始估计的冰床高程，m），
+<code>widths</code>（ndarray -- 各网格点处的冰川宽度，m），
+<code>widths_m</code>（ndarray -- 数值格式中交错网格上的宽度，m），
+<code>dx</code>（float -- 沿流线网格间距），
+<code>dx_meter</code>（float -- 实际米数网格间距），
+<code>is_tidewater</code>（bool），
+<code>is_rectangular</code>（bool -- 冰床类型标志），
+<code>is_trapezoid</code>（bool -- 冰床类型标志），
+<code>is_parabolic</code>（bool -- 冰床类型标志），
+<code>flows_to</code>（MixedBedFlowline 或 None -- 支流连接）。</p>
+</div>
+
+<div class="file-card">
+<h4>model_diagnostics.nc -- 模型输出诊断</h4>
+<div class="meta">格式: NetCDF4 | BASENAMES 键: <code>model_diagnostics</code></div>
+<p><strong>用途:</strong> 流线模型运行期间存储的模型诊断变量时间序列。</p>
+<p><strong>维度:</strong> <code>time</code>（逐年，每个存储年份一个条目），<code>flowlines</code>（每条流线一个，用于每条流线的独立变量）。</p>
+<p><strong>变量清单:</strong></p>
+<table>
+<thead><tr><th>变量</th><th>维度</th><th>单位</th><th>描述</th></tr></thead>
+<tbody>
+<tr><td><code>volume_m3</code></td><td>(time, flowlines)</td><td>m³</td><td>每条流线每年的冰体积</td></tr>
+<tr><td><code>area_m2</code></td><td>(time, flowlines)</td><td>m²</td><td>每条流线每年的表面积</td></tr>
+<tr><td><code>length_m</code></td><td>(time, flowlines)</td><td>m</td><td>每条流线每年的长度</td></tr>
+<tr><td><code>calving_m3</code></td><td>(time, flowlines)</td><td>m³ yr⁻¹</td><td>每条流线的崩解通量（陆地终止冰川为 0）</td></tr>
+<tr><td><code>ela_m</code></td><td>(time)</td><td>m a.s.l.</td><td>冰川整体平衡线高度</td></tr>
+<tr><td><code>dmdtda_mmwea</code></td><td>(time)</td><td>mm w.e. yr⁻¹</td><td>比物质平衡率</td></tr>
+</tbody>
+</table>
+<p><strong>可选（如果 <code>store_model_geometry=True</code>）:</strong> <code>surface_h</code>、<code>bed_h</code>、<code>thickness_m</code>、
+<code>ice_velocity_myr</code> -- 这些变量会增加一个额外的 <code>dis_along_flowline</code> 维度。</p>
+</div>
+
+<div class="file-card">
+<h4>mb_calib.json -- 物质平衡校准</h4>
+<div class="meta">格式: JSON | BASENAMES 键: <code>mb_calib</code></div>
+<p><strong>用途:</strong> 存储冰川的校准物质平衡参数。</p>
+<p><strong>结构:</strong></p>
+<pre><code>{
+  "melt_f": 4.2,
+  "temp_bias": 0.3,
+  "prcp_fac": 1.0,
+  "reference_mb": -850.0,
+  "reference_period": "2000-01-01_2015-12-31",
+  "calibration_method": "geodetic_mb_consensus",
+  "t_star": 1920.5,
+  "bias": 0.03
+}</code></pre>
+<p><strong>关键字段:</strong>
+<code>melt_f</code> -- 度日融化因子（kg m⁻² K⁻¹ day⁻¹），
+<code>temp_bias</code> -- 温度偏差校正（K），
+<code>prcp_fac</code> -- 降水校正因子（1.0 = 无校正），
+<code>t_star</code> -- 校准参考年份（物质平衡近似等于参考值的年份）。</p>
+</div>
+
+<div class="file-card">
+<h4>geometries.pkl -- 多边形几何</h4>
+<div class="meta">格式: pickle | BASENAMES 键: <code>geometries</code></div>
+<p><strong>用途:</strong> 存储冰川的 GIS 多边形几何（流域多边形、相交多边形、流线流域）。</p>
+<p><strong>内容:</strong> dict，包含以下键：
+<code>polygon_pix</code>（list -- 以像素坐标表示的冰川掩膜），
+<code>polygon_hr</code>（shapely Polygon -- 以 shapely 几何表示的冰川轮廓），
+<code>catchments</code>（dict -- 将流线索引映射到流域多边形，如果已计算），
+<code>intersects</code>（Polygon 列表 -- 相交的冰川多边形，如果存在）。</p>
+</div>
+
+<div class="file-card">
+<h4>hypsometry.csv -- 测高统计</h4>
+<div class="meta">格式: CSV | BASENAMES 键: <code>hypsometry</code></div>
+<p><strong>用途:</strong> 测高表：高程区间及其对应的冰川面积。</p>
+<p><strong>列:</strong> <code>elevation</code>（m a.s.l. -- 高程区间中心），
+<code>area</code>（m² -- 该高程区间内的冰川面积），
+<code>width</code>（m -- 该高程处的冰川总宽度）。</p>
+<p>该 CSV 由 <code>initialize_flowlines</code> 生成，并在物质平衡计算和可视化中内部使用。</p>
+</div>
+
+<div class="file-card">
+<h4>diagnostics.json -- 处理诊断信息</h4>
+<div class="meta">格式: JSON | BASENAMES 键: <code>diagnostics</code></div>
+<p><strong>用途:</strong> 记录处理元数据和诊断信息，用于溯源和调试。</p>
+<p><strong>典型内容:</strong></p>
+<pre><code>{
+  "dem_source": "SRTM",
+  "dem_resolution": 30.0,
+  "grid_dx": 100,
+  "grid_dy": 100,
+  "map_proj": "tmerc",
+  "rgi_area_km2": 8.45,
+  "glacier_area_on_grid_km2": 8.43,
+  "n_centerlines": 3,
+  "centerlines_total_length_m": 12450,
+  "n_flowlines": 3,
+  "prepro_level": 3,
+  "has_climate": true,
+  "climate_source": "CRU",
+  "mb_calibration_done": true,
+  "inversion_done": true
+}</code></pre>
+</div>
+
+<h2>C.3 读写模式</h2>
+
+<p>OGGM 在 GlacierDirectory 上为每种文件类型提供了标准化的读写方法：</p>
+
+<pre><code># NetCDF 文件
+gdir.write_netcdf(data_dict, basename_key, filesuffix='')
+ds = xr.open_dataset(gdir.get_filepath(basename_key, filesuffix=''))
+
+# Pickle 文件
+gdir.write_pickle(obj, basename_key, filesuffix='')
+obj = gdir.read_pickle(basename_key, filesuffix='')
+
+# JSON 文件
+gdir.write_json(obj, basename_key, filesuffix='')
+obj = gdir.read_json(basename_key, filesuffix='')
+
+# Shapefile 文件
+gdir.write_shapefile(gdf, basename_key, filesuffix='')
+gdf = gpd.read_file(gdir.get_filepath(basename_key, filesuffix=''))
+
+# 文本/CSV 文件
+gdir.write_text(text, basename_key, filesuffix='')
+text = gdir.read_text(basename_key, filesuffix='')</code></pre>
+
+<div class="chapter-nav">
+  <a href="appendix_b.html">← 附录B 参数参考手册</a>
+  <a href="appendix_d.html">附录D 术语表 →</a>
+</div>
+
+<footer>
+  OGGM 源码深度解析 &mdash; 附录C 文件格式参考
+</footer>
+
+</body>
+</html>

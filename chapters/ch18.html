@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第18章 图形与可视化 — OGGM 源码深度解析</title>
+<style>
+  :root {
+    --bg: #fafaf9;
+    --card: #ffffff;
+    --text: #1c1917;
+    --muted: #57534e;
+    --border: #e7e5e4;
+    --accent: #2563eb;
+    --accent-dim: #dbeafe;
+    --warn-bg: #fef3c7;
+    --warn-fg: #92400e;
+    --tip-bg: #d1fae5;
+    --tip-fg: #065f46;
+    --expert-bg: #ede9fe;
+    --expert-fg: #5b21b6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; }
+  .container { max-width: 860px; margin: 0 auto; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 3rem 3.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+  h1 { font-size: 2.2rem; border-bottom: 3px solid var(--accent); padding-bottom: .5rem; margin-bottom: .4rem; }
+  h2 { font-size: 1.55rem; margin: 2.2rem 0 .6rem; padding: .3rem 0; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.22rem; margin: 1.5rem 0 .5rem; color: var(--muted); }
+  h4 { font-size: 1.05rem; margin: 1.2rem 0 .4rem; }
+  p { margin: .7rem 0; }
+  pre { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 1rem 1.2rem; overflow-x: auto; font-size: .88rem; line-height: 1.5; margin: 1rem 0; }
+  code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88rem; }
+  :not(pre) > code { background: #f0efed; color: #b91c1c; padding: .12em .4em; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  thead { background: var(--accent-dim); }
+  th, td { border: 1px solid var(--border); padding: .5rem .7rem; text-align: left; }
+  th { font-weight: 600; }
+  .callout { border-left: 4px solid; border-radius: 6px; padding: .8rem 1rem; margin: 1.2rem 0; }
+  .callout.warning { background: var(--warn-bg); border-color: #f59e0b; color: var(--warn-fg); }
+  .callout.tip { background: var(--tip-bg); border-color: #10b981; color: var(--tip-fg); }
+  .callout.expert { background: var(--expert-bg); border-color: #8b5cf6; color: var(--expert-fg); }
+  .callout-title { font-weight: 700; display: block; margin-bottom: .25rem; }
+  .tag { display: inline-block; font-size: .78rem; font-weight: 600; padding: .15em .6em; border-radius: 99px; margin-right: .3em; }
+  .tag-beginner { background: #d1fae5; color: #065f46; }
+  .tag-intermediate { background: #fef3c7; color: #92400e; }
+  .tag-advanced { background: #ede9fe; color: #5b21b6; }
+  .chapter-nav { display: flex; justify-content: space-between; margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: .9rem; }
+  footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>第18章 图形与可视化</h1>
+<p><span class="tag tag-beginner">入门</span> <span class="tag tag-intermediate">可视化</span></p>
+<p><code>graphics.py</code>是OGGM的可视化模块。尽管在代码量上（约32KB）不及workflow.py等核心模块，但它提供了从冰川几何到模型诊断的全面可视化功能。本章系统介绍各类型图表的绘制函数、底层基础设施、以及与GriddedNcdfFile的集成。</p>
+
+<div class="callout tip">
+  <span class="callout-title">应用研究的最低作图清单</span>
+  <p>正式分析前至少应查看四类图：冰川轮廓与DEM是否对齐、中心线是否沿主流方向、反演厚度是否集中在合理位置、模型诊断时间序列是否有突跳。很多区域统计错误都能在这四类图中提前发现。</p>
+</div>
+
+<table>
+<thead><tr><th>想检查什么</th><th>推荐图</th><th>异常信号</th></tr></thead>
+<tbody>
+<tr><td>RGI边界和DEM</td><td><code>plot_domain</code></td><td>轮廓错位、DEM空洞、边界太小</td></tr>
+<tr><td>中心线和支流</td><td><code>plot_centerlines</code></td><td>中心线过短、穿出冰川、支流汇合异常</td></tr>
+<tr><td>反演厚度</td><td><code>plot_inversion</code>或自定义剖面图</td><td>厚度集中在末端、局部尖峰、体积异常</td></tr>
+<tr><td>模拟输出</td><td><code>plot_modeloutput_timeseries</code></td><td>体积/面积突然跳变、长度不合理增长</td></tr>
+</tbody>
+</table>
+
+<h2>18.1 模块架构概览</h2>
+
+<p><code>graphics.py</code>基于matplotlib构建，封装了OGGM特定的可视化逻辑。它的设计遵循几个核心原则：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>一致性</strong>：所有绘图函数共享统一的色彩方案、字体设置和输出格式。</li>
+  <li><strong>即用性</strong>：函数接受OGGM的标准数据结构（GlacierDirectory、GriddedNcdfFile），无需用户手动提取数据。</li>
+  <li><strong>可扩展性</strong>：返回matplotlib axes对象，允许用户在默认绘图基础上任意修改。</li>
+</ul>
+
+<h2>18.2 图形基础设施</h2>
+
+<h3>18.2.1 字体与排版</h3>
+
+<p>OGGM在字体支持上追求专业品质。当系统安装了Google Rockefeller Building字体（OGGM品牌字体）时，graphics.py自动使用该字体渲染图表文本。否则回退到matplotlib默认字体。</p>
+
+<pre>def _check_rockefeller_font():
+    """Check for the Google Rockefeller Building font."""
+    from matplotlib.font_manager import findfont, FontProperties
+    font = findfont(FontProperties(family='Rockefeller'))
+    return font != FontProperties().get_file()</pre>
+
+<p>这一设计体现了OGGM对图表美观的重视。Rockefeller Building字体是一种圆润的几何无衬线字体，用于OGGM的标识和文档。</p>
+
+<h3>18.2.2 色彩方案</h3>
+
+<p>OGGM定义了一套标准颜色映射和配色方案，所有图表函数共享：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>冰川几何</strong>：深蓝至青色渐层（用于海拔、深度等高程相关数据）</li>
+  <li><strong>流线网络</strong>：暖色系渐层（红色至橙色，用于区分主线和支流编号）</li>
+  <li><strong>物质平衡</strong>：蓝白红发散色图（蓝=积累，白=平衡，红=消融）</li>
+  <li><strong>诊断比较</strong>：高对比度离散色（蓝色=观测，红色=模型，绿色=差异）</li>
+</ul>
+
+<h3>18.2.3 图形保存</h3>
+
+<p>所有绘图函数通过统一的保存接口输出图形，支持可配置的分辨率（dpi）和多格式输出：</p>
+
+<pre>def _savefig(fig, path, dpi=None):
+    """Centralized figure saving with configurable resolution."""
+    if dpi is None:
+        dpi = cfg.PARAMS.get('plot_dpi', 150)
+    fig.savefig(path, dpi=dpi, bbox_inches='tight', facecolor='w')</pre>
+
+<h2>18.3 冰川几何可视化</h2>
+
+<h3>18.3.1 plot_domain：冰川全貌概览</h3>
+
+<p><code>plot_domain</code>是最常用的入门级绘图函数。它以单个图形展示冰川的完整空间范围：</p>
+
+<pre>plot_domain(gdir, ax=None, title=True,
+            add_colorbar=True, add_scale_bar=True)</pre>
+
+<p>该函数在一个图中叠加以下元素：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>底层</strong>：DEM地形阴影（hillshade），来自gdir的栅格化（rasterization）高程数据</li>
+  <li><strong>轮廓</strong>：冰川边界线（RGI outline），黑色实线</li>
+  <li><strong>格网</strong>：GlacierDirectory定义的内部计算格网</li>
+  <li><strong>流线</strong>：中心线网络（如果已计算），按支流编号着色</li>
+  <li><strong>色彩条</strong>：DEM高程映射的colorbar</li>
+  <li><strong>比例尺</strong>：可选的地理比例尺（公里）</li>
+</ul>
+
+<p>在开发新的冰川目录（GlacierDirectory）处理流程时，<code>plot_domain</code>是验证格网定义和数据完整性的第一道防线。如果DEM投影错误、格网偏移或流线计算异常，这些都能在概览图中立即显现。</p>
+
+<h3>18.3.2 plot_centerlines：流线网络</h3>
+
+<p><code>plot_centerlines</code>专门可视化中心线计算结果：</p>
+
+<pre>plot_centerlines(gdir, ax=None, title=True,
+                 use_flowlines=False, add_scale_bar=True)</pre>
+
+<p>参数解析：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><code>use_flowlines=False</code>（默认）：绘制几何中心线（由中心线算法生成），以线条粗细表示冰川宽度。</li>
+  <li><code>use_flowlines=True</code>：绘制离散化后的流线（由flowline discretization生成），宽度变化通过streamplot或填充多边形表示。</li>
+</ul>
+
+<p>每条流线的宽度编码了集水区几何信息，主线和支流以不同颜色区分。这种可视化对于诊断流线网络的拓扑正确性至关重要——例如检测支流是否与主线正确相交、宽度是否在交汇处平滑过渡。</p>
+
+<h3>18.3.3 plot_catchment_width：集水区几何</h3>
+
+<p><code>plot_catchment_width</code>将冰川几何沿流线的分布以曲线图形式展示。该函数绘制两个关键诊断量：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>集水区面积沿流线分布</strong>：验证面积守恒（各流线段上面积之和应等于总冰川面积）</li>
+  <li><strong>宽度沿流线分布</strong>：显示冰川宽度从积累区到消融区的变化趋势</li>
+</ul>
+
+<p>这些曲线对于反演和模型模拟是输入参数，因此可视化检查它们的平滑性和物理合理性是质量控制的重要步骤。</p>
+
+<h2>18.4 物质平衡可视化</h2>
+
+<h3>18.4.1 plot_mass_balance_grad：物质平衡梯度</h3>
+
+<p>OGGM的温度指数模型（temperature-index model）将物质平衡表达为海拔的函数。该函数绘制三种关键曲线：</p>
+
+<pre>plot_mass_balance_grad(gdir, ax=None, title=True)</pre>
+
+<p>图表中显示：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>消融梯度</strong>：随海拔下降的消融速率（正梯度=较低海拔有更多消融）</li>
+  <li><strong>积累梯度</strong>：随海拔上升的积累速率（通常为固态降水）</li>
+  <li><strong>平衡线</strong>：物质平衡为零的海拔高度（ELA）</li>
+  <li><strong>mu*校准参考</strong>：用虚线标注温度敏感度参数mu*的值</li>
+</ul>
+
+<p>这种可视化直接反映了物质平衡校准的质量——如果ELA偏离观测值过多，mu*的调整可能有问题。</p>
+
+<h3>18.4.2 plot_mb_ts 和 plot_annual_mb_ts</h3>
+
+<p>这两个函数以时间序列形式展示物质平衡：</p>
+
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><code>plot_mb_ts</code>：给定气候序列下的年际物质平衡变化，叠加累积物质平衡曲线。累积曲线向下倾斜表示冰川净质量减少。</li>
+  <li><code>plot_annual_mb_ts</code>：以热力图形式展示每条高度带的年度物质平衡，x轴为时间，y轴为海拔，颜色编码物质平衡数值。</li>
+</ul>
+
+<div class="callout tip">
+  <span class="callout-title">实践建议</span>
+  使用<code>plot_annual_mb_ts</code>可以直观发现气候驱动事件——例如特别极端的一年会导致从积累区到消融区的整体负异常，在热力图上表现为单一的垂直暗带。
+</div>
+
+<h2>18.5 模型输出可视化</h2>
+
+<p>模型输出可视化是graphics.py最复杂也最有价值的部分。三个核心函数覆盖了空间、剖面和时间三个维度。</p>
+
+<h3>18.5.1 plot_modeloutput_map：2D厚度与速度图</h3>
+
+<p>从<code>GriddedNcdfFile</code>中提取格网化的模型输出并将其渲染为地理地图：</p>
+
+<pre>plot_modeloutput_map(gdir, ax=None,
+                     variable='thickness',
+                     model_results_path=None,
+                     add_colorbar=True,
+                     title=True)</pre>
+
+<p>支持的可视化变量包括：</p>
+<table>
+  <thead><tr><th>变量</th><th>含义</th><th>推荐色图</th></tr></thead>
+  <tbody>
+    <tr><td><code>thickness</code></td><td>冰川厚度（米）</td><td>蓝白红（厚-薄）</td></tr>
+    <tr><td><code>velocity</code></td><td>表面速度（米/年）</td><td>暖色渐层</td></tr>
+    <tr><td><code>surface_h</code></td><td>表面高程（米）</td><td>地形色图</td></tr>
+    <tr><td><code>mass_balance</code></td><td>物质平衡（mm w.e. yr⁻¹，毫米水当量 water equivalent）</td><td>蓝白红发散</td></tr>
+  </tbody>
+</table>
+
+<p>该函数处理从流线坐标到地理坐标的重映射和格网插值，确保输出与地理参考对齐。</p>
+
+<h3>18.5.2 plot_modeloutput_section：流线剖面图</h3>
+
+<p>这是OGGM的核心诊断可视化：沿主要流线的冰川横截面和纵剖面。一个典型的剖面图包含五个面板：</p>
+
+<pre>plot_modeloutput_section(gdir, ax=None,
+                         model_results_path=None,
+                         title=True)</pre>
+
+<p>五个面板布局为：</p>
+<ol style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>冰床与表面高程</strong>：沿流线方向（x轴）的冰川表面和底部高程曲线，填充冰川体积。</li>
+  <li><strong>冰厚剖面</strong>：沿流线的冰厚变化。</li>
+  <li><strong>冰川宽度</strong>：沿流线的宽度曲线。</li>
+  <li><strong>冰流通量</strong>：沿流线的冰体积通量（单位时间通过横截面的冰量）。</li>
+  <li><strong>表面速度</strong>：沿流线的模拟表面速度。</li>
+</ol>
+
+<p>这五个面板提供了对冰川动力学的一站式可视化。例如，冰流通量与宽度和厚度的关系可以验证物质守恒是否正确求解。</p>
+
+<h3>18.5.3 plot_modeloutput_timeseries：时间序列</h3>
+
+<p>绘制模型运行期间冰川关键指标的时间演变：</p>
+
+<pre>plot_modeloutput_timeseries(gdir,
+                            model_results_path=None,
+                            axs=None,
+                            title=True)</pre>
+
+<p>绘制以下时间序列：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>冰川体积</strong>：总体积随时间变化（通常显示退缩趋势）</li>
+  <li><strong>冰川面积</strong>：总面积随时间变化</li>
+  <li><strong>冰川长度</strong>：沿主支流线的长度变化，是气候变化的直接响应指标</li>
+  <li><strong>平衡线海拔(ELA)</strong>：如可用，显示平衡线海拔的时间变化</li>
+</ul>
+
+<div class="callout expert">
+  <span class="callout-title">深入理解</span>
+  冰川长度对气候变化的响应具有滞后性（通常数年）。可以通过比较体积和长度的时间序列来估计冰川响应时间——体积对气候变化的响应更即时（因为厚度变化直接影响体积），而长度需要冰动力学传播，因此滞后更明显。
+</div>
+
+<h2>18.6 诊断可视化</h2>
+
+<h3>18.6.1 plot_inversion：反演结果诊断</h3>
+
+<p><code>plot_inversion</code>是验证冰厚反演质量的核心工具。它对比反演的冰厚与可用观测数据（如雷达测厚、Farinotti共识估计等）：</p>
+
+<pre>plot_inversion(gdir, ax=None, title=True,
+               linewidth=2, varname='volume')</pre>
+
+<p>图形类型取决于<code>varname</code>参数：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><code>varname='volume'</code>：散点图，x轴为观测体积，y轴为反演体积。对角线表示完美匹配。</li>
+  <li><code>varname='thickness'</code>：沿流线的冰厚剖面，叠加观测厚度点。</li>
+</ul>
+
+<p>在L3（反演级别）完成后，应始终使用此函数检查反演质量。系统性偏差（如反演厚度持续偏高）可能表示Glen A参数需要重新校准。</p>
+
+<h3>18.6.2 plot_velocity：表面速度对比</h3>
+
+<p>如果可用（如ITS_LIVE数据已通过<code>--add-itslive-velocity</code>添加到L3），该函数将模拟的冰川表面速度与卫星观测的冰川表面速度进行对比。</p>
+
+<h3>18.6.3 plot_thickness_map：冰厚专题图</h3>
+
+<p>生成印刷品质的冰川冰厚分布专题地图，包含完整的图例、比例尺和标题。与<code>plot_modeloutput_map(variable='thickness')</code>不同，<code>plot_thickness_map</code>专注于冰厚这一核心科学生产，提供更精美的默认呈现。</p>
+
+<h2>18.7 GriddedNcdfFile集成</h2>
+
+<p>OGGM的格网化输出使用<code>GriddedNcdfFile</code>格式（基于NetCDF）。graphics.py中的地图类函数（<code>plot_modeloutput_map</code>）直接读取此格式并进行可视化：</p>
+
+<pre># 典型使用工作流
+from oggm import GraphicsGridded, GriddedNcdfFile
+
+# 加载格网化输出
+gridded = GriddedNcdfFile(path_to_gridded_output)
+
+# 创建可视化器并绑定格网数据（gridded data）
+graphics = GraphicsGridded(gridded)
+
+# 绘制厚度图和速度图
+graphics.plot_thickness()
+graphics.plot_velocity()</pre>
+
+<p><code>GraphicsGridded</code>类封装了格网数据（gridded data）的可视化逻辑，包括投影转换、颜色映射、等值线和矢量箭头叠加。</p>
+
+<h2>18.8 扩展与自定义</h2>
+
+<h3>18.8.1 基于Matplotlib的自定义</h3>
+
+<p>所有OGGM绘图函数都返回matplotlib axes对象，这使得用户可以在默认图形上叠加自定义内容。例如，在domain图上标注特定研究点位：</p>
+
+<pre>fig, ax = plt.subplots(figsize=(10, 8))
+plot_domain(gdir, ax=ax)
+ax.scatter(lon_point, lat_point, c='red', marker='*',
+           s=200, label='Research site')
+ax.legend()
+plt.savefig('custom_domain.png', dpi=300, bbox_inches='tight')</pre>
+
+<h3>18.8.2 创建自定义可视化函数</h3>
+
+<p>创建自定义绘图函数需要遵从graphics.py的约定：</p>
+
+<ol style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li>函数前两个参数应为<code>gdir</code>和<code>ax=None</code></li>
+  <li>如果<code>ax</code>为None，在函数内创建新的figure和axes</li>
+  <li>返回axes对象供调用者进一步修改</li>
+  <li>使用<code>_savefig</code>统一保存接口（或直接调用fig.savefig）</li>
+</ol>
+
+<h2>18.9 图形导出格式</h2>
+
+<table>
+  <thead><tr><th>格式</th><th>特点</th><th>推荐用途</th></tr></thead>
+  <tbody>
+    <tr><td>PNG</td><td>高分辨率位图（150-600 dpi）</td><td>论文发表、演示、网页</td></tr>
+    <tr><td>PDF</td><td>矢量图形，无损缩放</td><td>出版级插图、LaTeX文档</td></tr>
+    <tr><td>SVG</td><td>可编辑矢量图形</td><td>后期编辑（Inkscape/Illustrator）、网页</td></tr>
+  </tbody>
+</table>
+
+<p>通过cfg.PARAMS中的<code>plot_dpi</code>参数控制默认分辨率。对于论文发表的图形，建议设置<code>plot_dpi=300</code>并使用PDF格式以保留矢量可编辑性。</p>
+
+<h2>18.10 小结</h2>
+
+<p><code>graphics.py</code>将OGGM的复杂科学输出转换为直观的出版物级图形。从冰川几何、物质平衡梯度到完整的模型剖面和时间序列，每个函数都经过精心设计以服务于科学分析和质量诊断的双重目的。理解这些可视化工具的含义和使用方法，是高效解读OGGM模型输出的基础技能。</p>
+
+<div class="chapter-nav">
+  <span>上一章：第17章 MPI并行计算</span>
+  <span>下一章：附录</span>
+</div>
+<footer>OGGM 源码深度解析 &copy; 2026</footer>
+
+</div>
+</body>
+</html>

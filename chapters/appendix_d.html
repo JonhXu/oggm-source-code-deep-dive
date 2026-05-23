@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>附录D 术语表 — OGGM 源码深度解析</title>
+<style>
+:root {
+  --bg: #fffdf8; --fg: #1a1a1a; --accent: #2c5f8a; --accent-light: #e8f0f7;
+  --code-bg: #f4f4f4; --border: #ddd;
+}
+body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg); line-height: 1.7; }
+h1 { font-size: 2rem; color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: .4rem; margin-top: 2.5rem; }
+h2 { font-size: 1.55rem; color: #1e4a6b; border-bottom: 2px solid #c8d8e8; padding-bottom: .25rem; margin-top: 2.2rem; }
+h3 { font-size: 1.25rem; color: #2c5f8a; margin-top: 1.6rem; }
+p { margin: .8rem 0; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: .9rem; line-height: 1.5; }
+code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88em; background: #eee; padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; font-size: inherit; }
+.chapter-nav { display: flex; justify-content: space-between; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.chapter-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+footer { text-align: center; color: #888; font-size: .85rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+thead { background: var(--accent); color: #fff; }
+th, td { padding: .5rem .65rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+tbody tr:nth-child(even) { background: #f9f9f9; }
+.callout { background: #e8f0f7; border-left: 5px solid var(--accent); padding: .75rem 1rem; border-radius: 6px; margin: 1rem 0; }
+.callout-title { font-weight: 700; display: block; margin-bottom: .25rem; }
+.glossary-entry { margin: 1.2rem 0; padding-left: 0; }
+.glossary-entry dt { font-weight: 700; font-size: 1.05rem; color: #1a1a1a; }
+.glossary-entry dt code { background: #e8f0f7; }
+.glossary-entry .zh { color: #2c5f8a; font-weight: 600; }
+.glossary-entry dd { margin: .3rem 0 .3rem 1.5rem; color: #444; }
+.glossary-entry dd + dd { margin-top: .15rem; }
+.glossary-entry .see { font-size: .88em; color: #888; }
+.toc { columns: 2; column-gap: 2rem; margin: 1rem 0; }
+.toc a { color: var(--accent); text-decoration: none; display: block; padding: .15rem 0; font-size: .95rem; }
+.toc a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>附录D 术语表 (Glossary)</h1>
+
+<p>
+本术语表定义了整个OGGM中使用的重要术语——包括冰川科学概念、
+OGGM特有抽象概念、数值方法和气候建模术语。每个条目提供英文术语、
+其中文翻译、定义以及其在OGGM中的使用背景。
+</p>
+
+<div class="callout tip">
+<span class="callout-title">最容易混淆的四组术语</span>
+<table>
+<thead><tr><th>术语</th><th>一句话区别</th></tr></thead>
+<tbody>
+<tr><td>气候物质平衡 vs. 表观物质平衡（apparent mass balance）</td><td>前者来自气候强迫和固定几何，后者为反演服务，把几何变化对应的通量散度也纳入考虑。</td></tr>
+<tr><td>大地测量物质平衡（geodetic mass balance） vs. 原位物质平衡</td><td>前者由DEM/卫星高程变化估算，覆盖广；后者来自地面观测，时间细但空间少。</td></tr>
+<tr><td>动态预热（dynamic spinup） vs. 平衡态实验</td><td>动态预热（dynamic spinup）匹配近期观测面积或体积，不保证严格平衡；平衡态实验要求长期净变化接近零。</td></tr>
+<tr><td>GlacierDirectory vs. Flowline</td><td>GlacierDirectory是整条冰川的数据文件夹；Flowline是其中用于动力学的一维几何对象。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>D.1 快速索引</h2>
+<div class="toc">
+<a href="#sec-a">A -- Ablation 至 AAR</a>
+<a href="#sec-b">B -- Basal sliding 至 Border</a>
+<a href="#sec-c">C -- Calving 至 CFL condition</a>
+<a href="#sec-d">D -- Deformation 至 Dynamic spinup</a>
+<a href="#sec-e">E -- ELA 至 Entity task</a>
+<a href="#sec-f">F -- Flowline 至 fs</a>
+<a href="#sec-g">G -- gdir 至 Gridded attributes</a>
+<a href="#sec-h">H -- Hypsometry</a>
+<a href="#sec-i">I -- Ice dynamics 至 Inversion</a>
+<a href="#sec-l">L -- Lapse rate</a>
+<a href="#sec-m">M -- Mass balance 至 Multiple flowlines</a>
+<a href="#sec-o">O -- OGGM</a>
+<a href="#sec-p">P -- Prepro level 至 PRCP</a>
+<a href="#sec-r">R -- RGI 至 RGIId</a>
+<a href="#sec-s">S -- SIA 至 Surge</a>
+<a href="#sec-t">T -- Temperature index model 至 Tributary</a>
+<a href="#sec-w">W -- Widths 至 Workflow</a>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="sec-a">A</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>AAR</strong> <span class="zh">积累区比率</span></dt>
+<dd>积累区比率（Accumulation Area Ratio）：积累区面积与冰川总面积之比。在OGGM中，AAR由物质平衡模型计算，用作冰川健康状况的诊断指标。AAR约为0.6通常对应于收支平衡（均衡）状态。</dd>
+<dd class="see">参见：ELA（平衡线高度）、Mass balance（物质平衡）、Accumulation area（积累区）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Ablation</strong> <span class="zh">消融</span></dt>
+<dd>冰川通过融化、升华、崩解或风蚀而损失冰雪的过程。在OGGM中，消融由温度指数（度日）模型计算，为melt_f与0°C以上正温度异常的乘积。</dd>
+<dd class="see">参见：Mass balance（物质平衡）、Accumulation（积累）、Melt factor（融化因子）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Accumulation</strong> <span class="zh">积累</span></dt>
+<dd>冰川通过降雪、雪崩或再冻结获得质量的过程。在OGGM的温度指数模型（temperature-index model）中，积累主要由固态降水部分表示；固态比例由<code>temp_all_solid</code>和<code>temp_all_liq</code>控制。</dd>
+<dd class="see">参见：Mass balance（物质平衡）、Ablation（消融）、Solid precipitation（固态降水）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Accumulation area</strong> <span class="zh">积累区</span></dt>
+<dd>冰川在平衡线高度以上、年物质平衡为正的部分。OGGM通过冰川表面地形与ELA的交点来计算积累区面积。</dd>
+<dd class="see">参见：ELA（平衡线高度）、AAR（积累区比率）、Ablation area（消融区）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Apparent mass balance</strong> <span class="zh">表观物质平衡</span></dt>
+<dd>物质平衡剖面，当从末端向上积分时，能够再现冰川各点处的观测冰通量。用作质量守恒反演的输入。与真实气候物质平衡不同，因为它包含了冰川几何变化（dH/dt）的影响。</dd>
+<dd class="see">参见：Inversion（反演）、Mass-conservation inversion（质量守恒反演）、Flux（通量）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-b">B</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Basal sliding</strong> <span class="zh">基底滑动</span></dt>
+<dd>冰川在冰-基岩界面处因冰床融水润滑而产生的滑移运动。在OGGM中，滑动速度参数化为 u_s = f_s * A * tau^n * H，其中 f_s 是滑动参数（cfg.PARAMS['fs']）。</dd>
+<dd class="see">参见：Deformation（变形）、fs（滑动参数）、SIA（浅冰近似）、Glen's law（格伦定律）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>BASENAMES</strong> <span class="zh">文件基础名注册表</span></dt>
+<dd>OGGM的内部注册表（<code>cfg.BASENAMES</code>），将逻辑文件名（如'gridded_data'）映射到物理文件名（如'gridded_data.nc'）及描述。由<code>gdir.get_filepath()</code>用于解析冰川目录（GlacierDirectory）中的文件路径。</dd>
+<dd class="see">参见：GlacierDirectory（冰川目录对象）、params.cfg（参数配置文件）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Bed topography (bed_h)</strong> <span class="zh">冰床地形</span></dt>
+<dd>冰川冰床（基岩表面）的海拔高程（m）。在反演前，bed_h是初始估计值（通常是从表面进行抛物线外推的结果）。反演后，它是求解出的基岩高程。</dd>
+<dd class="see">参见：Flowline（流线）、Surface elevation（表面高程）、Inversion（反演）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Border (prepro_border)</strong> <span class="zh">地图边界</span></dt>
+<dd>定义局部地图时，在冰川轮廓周围添加的网格像素数。较大的边界允许冰川在未来模拟中超出当前轮廓前进。典型值：10像素（相当于数百米）。</dd>
+<dd class="see">参见：Glacier grid（冰川格网）、define_glacier_region</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-c">C</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Calving</strong> <span class="zh">冰川崩解</span></dt>
+<dd>海洋或湖泊终止型冰川末端冰块脱离并形成冰山的过程。在OGGM核心模型中，入海型冰川可使用水深依赖的k-calving参数化；sandbox中还包含若干替代方案。</dd>
+<dd class="see">参见：Tidewater glacier（入海型冰川）、calving_k、calving_use_limiter</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Calving front</strong> <span class="zh">崩解前缘</span></dt>
+<dd>入海型冰川末端的临海/临湖面，冰山在此脱离。OGGM追踪崩解前缘位置，并在末端网格单元处应用崩解法则。</dd>
+<dd class="see">参见：Calving（崩解）、Tidewater glacier（入海型冰川）、Terminus（末端）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>calving_k</strong> <span class="zh">崩解系数</span></dt>
+<dd>水深依赖型崩解参数化中的比例常数（yr⁻¹）。OGGM v1.6.3默认值为0.6 yr⁻¹。更高的值通常产生更强的崩解通量。</dd>
+<dd class="see">参见：Calving（崩解）、params.cfg（参数配置文件）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Catchment</strong> <span class="zh">集水区/流域</span></dt>
+<dd>冰川表面上通过特定流线截面排水的区域。在OGGM中，每条中心线/流线都有一个相关联的集水多边形。集水区划分是流线初始化的关键步骤。</dd>
+<dd class="see">参见：Centerline（中心线）、Flowline（流线）、catchment_area</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Centerline</strong> <span class="zh">中心线</span></dt>
+<dd>从冰川末端到源头的几何线条，沿冰川流动方向追踪。中心线使用最小成本路径算法从DEM和冰川掩膜计算得出。它们构成了流线的基础骨架。</dd>
+<dd class="see">参见：Flowline（流线）、compute_centerlines、Tributary（支流）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>CFL condition</strong> <span class="zh">CFL 条件</span></dt>
+<dd>Courant-Friedrichs-Lewy条件：在显式（或半隐式）数值格式中对时间步长的稳定性约束。在OGGM中，CFL数控制自适应时间步长：dt必须满足 u * dt / dx &lt;= CFL_number。默认CFL数：0.02。</dd>
+<dd class="see">参见：cfl_number、FluxBasedModel、Adaptive time-stepping（自适应时间步长）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-d">D</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Deformation (ice)</strong> <span class="zh">冰变形</span></dt>
+<dd>冰川因应力作用下冰晶体内部蠕变而产生的运动。由格伦流动定律描述。在OGGM中，变形速度是冰通量的主要成分，基底滑动为补充。</dd>
+<dd class="see">参见：Glen's law（格伦定律）、SIA（浅冰近似）、Basal sliding（基底滑动）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Degree-day model</strong> <span class="zh">度日模型</span></dt>
+<dd>一种经验性冰川融化模型：melt = melt_f * max(T - T_threshold, 0)。它对输入数据要求较低，适合大尺度长期模拟；能量平衡模型物理过程更完整，但需要更多气象变量。OGGM使用月度温度指数（度日）模型。</dd>
+<dd class="see">参见：Temperature index model（温度指数模型）、melt_f（融化因子）、Mass balance model（物质平衡模型）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Delta method</strong> <span class="zh">增量方法</span></dt>
+<dd>未来气候预估的一种技术：计算GCM未来期与GCM历史期之间的异常（增量），然后将此增量叠加到观测到的历史气候上。OGGM的<code>historical_delta_method()</code>实现此方法。</dd>
+<dd class="see">参见：GCM（全球气候模式）、Climate projection（气候预估）、process_gcm_data</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>DEM (Digital Elevation Model)</strong> <span class="zh">数字高程模型</span></dt>
+<dd>地表高程的栅格化（rasterization）网格数据。OGGM使用DEM获取冰川表面地形，从中导出坡度、坡向、中心线和初始冰床估计。支持多种DEM数据源：SRTM、ASTER、AW3D30、COP-DEM和自定义源。</dd>
+<dd class="see">参见：process_dem、dem_source、glacier_grid（冰川格网）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Diffusivity</strong> <span class="zh">扩散系数</span></dt>
+<dd>在SIA中，冰川演化被描述为一个非线性扩散方程：dH/dt = d/dx (D * dS/dx) + b_dot，其中D是冰扩散系数，正比于 A * tau^(n-1) * H^(n+2)。OGGM的流线模型数值求解此方程。</dd>
+<dd class="see">参见：SIA（浅冰近似）、FluxBasedModel、Glen's law（格伦定律）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Dynamic spinup</strong> <span class="zh">动态预热</span></dt>
+<dd>一种动力学初始化方法：在近期历史气候下调整温度偏差和预热（spinup）时段，使模拟冰川在目标年份匹配RGI附近的面积或体积。它用于减小直接从观测几何启动正演时的初始化冲击；结果不是唯一解。</dd>
+<dd class="see">参见：run_dynamic_spinup、Dynamic melt_f calibration、Equilibrium（平衡状态）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-e">E</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>ELA (Equilibrium Line Altitude)</strong> <span class="zh">平衡线高度</span></dt>
+<dd>年度积累量与消融量相等（净物质平衡=0）的高程。ELA将积累区与消融区分开。在OGGM中，ELA由<code>MassBalanceModel.get_ela()</code>计算，即物质平衡剖面的零交点。</dd>
+<dd class="see">参见：AAR（积累区比率）、Mass balance（物质平衡）、Accumulation（积累）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Entity task</strong> <span class="zh">实体任务（entity task，冰川级任务）</span></dt>
+<dd>以<code>@entity_task</code>装饰的单冰川处理函数。实体任务（entity task）是OGGM工作流的构建模块：它们以GlacierDirectory作为第一个参数，执行特定的处理步骤，并（可选）写入输出文件。装饰器提供自动日志记录、错误处理和依赖追踪。</dd>
+<dd class="see">参见：GlacierDirectory（冰川目录对象）、execute_entity_task、Global task（全局任务）、workflow（工作流）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Equilibrium</strong> <span class="zh">平衡状态</span></dt>
+<dd>冰川表面积分的物质平衡为零且冰川几何不再变化的理想状态。OGGM中的质量守恒反演并不简单假设现代冰川严格平衡，而是通过表观物质平衡（apparent mass balance）把几何变化对应的通量散度纳入反演。动态预热（dynamic spinup）用于减小初始化瞬态，使模型状态更接近观测面积或体积，但不保证得到严格平衡态。</dd>
+<dd class="see">参见：Dynamic spinup（动态预热）、Mass-conservation inversion（质量守恒反演）、Steady state（稳态）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-f">F</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Flowline</strong> <span class="zh">流线</span></dt>
+<dd>冰川沿流动方向的一维表示。流线由中心线导出，携带数值模拟所需的全部几何信息：表面高程、冰床高程、冰川宽度和网格间距。OGGM的动力学模型在流线（1D）上运行，而非在完整二维网格上运行。</dd>
+<dd class="see">参见：Centerline（中心线）、MixedBedFlowline（混合基底流线）、Flowline model（流线模型）、Multiple flowlines（多流线）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Flowline model</strong> <span class="zh">流线模型</span></dt>
+<dd>沿一维流线求解冰川演化方程的数值模型。OGGM提供多种求解器：<code>SemiImplicitModel</code>（v1.6.3配置文件默认，半隐式，自适应时间步长）、<code>FluxBasedModel</code>（显式通量方案，支持多流线和崩解相关处理）和<code>FileModel</code>（读取预计算输出）。</dd>
+<dd class="see">参见：FluxBasedModel、SemiImplicitModel、Flowline（流线）、Step（时间步进）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Flux (ice flux)</strong> <span class="zh">冰通量</span></dt>
+<dd>单位时间通过冰川截面的冰体积，常以m³ yr⁻¹或m³ s⁻¹表示，具体取决于输出文件或源码上下文。冰通量是截面积与深度平均速度的乘积。在SIA中，通量与表面坡度和冰厚度的(n+2)次方成正比。</dd>
+<dd class="see">参见：SIA（浅冰近似）、Diffusivity（扩散系数）、Mass conservation（质量守恒）、Inversion（反演）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Flux limiter</strong> <span class="zh">通量限制器</span></dt>
+<dd>一种数值方法，通过将冰通量限制在物理合理值范围内，防止SIA通量计算中出现非物理振荡。OGGM在<code>FluxBasedModel</code>中使用通量限制器（flux limiter），以维持末端附近薄冰的数值稳定性。</dd>
+<dd class="see">参见：FluxBasedModel、CFL condition（CFL条件）、sia_fluxlim</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>fs (Sliding parameter)</strong> <span class="zh">滑动参数</span></dt>
+<dd>控制基底滑动对总冰速度贡献的无量纲参数（0到1）。fs=0表示无滑动（全部变形），fs=1表示最大滑动。默认值为0（仅变形），对大多数冰川而言是保守的。</dd>
+<dd class="see">参见：Basal sliding（基底滑动）、Glen's law（格伦定律）、Flowline model（流线模型）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-g">G</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>gdir (GlacierDirectory)</strong> <span class="zh">冰川目录对象</span></dt>
+<dd>表示单个冰川及其关联数据文件的中央Python对象。由<code>workflow.init_glacier_directories()</code>创建或直接通过<code>utils.GlacierDirectory()</code>创建。提供读取、写入和访问冰川元数据及数据文件的方法。在OGGM代码中通常缩写为<code>gdir</code>。</dd>
+<dd class="see">参见：BASENAMES（文件基础名注册表）、Entity task（实体任务）、Working directory（工作目录）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>GCM (Global Climate Model)</strong> <span class="zh">全球气候模式</span></dt>
+<dd>大气环流模式（General Circulation Model）：基于物理学原理的全球气候系统数值模型。OGGM使用GCM输出（温度与降水预估）驱动未来冰川演化模拟，通常通过增量方法实现。</dd>
+<dd class="see">参见：Delta method（增量方法）、Climate projection（气候预估）、process_gcm_data</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Glacier grid</strong> <span class="zh">冰川格网</span></dt>
+<dd>冰川的局部坐标系统，由<code>define_glacier_region()</code>定义并存储在<code>glacier_grid.json</code>中。一个以冰川为中心的投影网格（通常为横轴墨卡托投影），分辨率由冰川面积决定。</dd>
+<dd class="see">参见：define_glacier_region、DEM（数字高程模型）、Grid resolution（网格分辨率）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Glen's law / Glen's A / Glen's n</strong> <span class="zh">格伦流动定律</span></dt>
+<dd>冰蠕变的本构关系：strain_rate = A * tau^n，其中A是速率因子（温度相关），tau是剪切应力，n~3是幂律指数。OGGM在整个流程中使用格伦定律：反演中（用于关联厚度与通量）和流线模型中（用于计算冰速度）。默认值：A=2.4e-24 s⁻¹ Pa⁻³, n=3。</dd>
+<dd class="see">参见：glen_a、glen_n、Deformation（变形）、SIA（浅冰近似）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Global task</strong> <span class="zh">全局任务（global task）</span></dt>
+<dd>以<code>@global_task</code>装饰的任务，对所有冰川集中操作而非逐个处理。示例包括下载参考数据集、汇总区域统计信息和初始化多进程池。</dd>
+<dd class="see">参见：Entity task（实体任务）、workflow（工作流）、execute_entity_task</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Gridded attributes</strong> <span class="zh">格网属性</span></dt>
+<dd>从DEM计算的逐像素地形变量：坡度、坡向和到轮廓的距离。这些数据存储在<code>gridded_data.nc</code>中，用于中心线计算和物质平衡分布。</dd>
+<dd class="see">参见：DEM（数字高程模型）、gridded_data.nc、gridded_attributes</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-h">H</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Hypsometry</strong> <span class="zh">高度-面积分布</span></dt>
+<dd>冰川面积作为海拔函数的分布。OGGM在流线初始化时计算高度-面积分布曲线，并存储在<code>hypsometry.csv</code>中。高度-面积分布用于将气候数据分布到各高程，并计算冰川整体物质平衡。</dd>
+<dd class="see">参见：Flowline（流线）、hypsometry.csv、Mass balance（物质平衡）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-i">I</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Ice dynamics</strong> <span class="zh">冰动力学</span></dt>
+<dd>冰川流动的物理学，由质量守恒、动量守恒和能量守恒控制。在OGGM中，冰动力学被简化为浅冰近似（SIA），这是一种在水平尺度远大于冰厚（纵横比远小于1）的冰体上有效的简化。</dd>
+<dd class="see">参见：SIA（浅冰近似）、Flowline model（流线模型）、Deformation（变形）、Basal sliding（基底滑动）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Ice thickness / Ice thickness distribution</strong> <span class="zh">冰厚/冰厚分布</span></dt>
+<dd>冰川冰的垂直维度。冰厚度是质量守恒反演的主要未知量。沿冰川和跨冰川的厚度分布决定了体积，是动力学模拟的起点。</dd>
+<dd class="see">参见：Inversion（反演）、Mass-conservation inversion（质量守恒反演）、volume（体积）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Inversion</strong> <span class="zh">反演</span></dt>
+<dd>从可观测物理量（表面地形、现有表面速度观测和物质平衡）推求冰厚度的过程。OGGM的主要反演方法是质量守恒反演，该方法求解满足通量连续性的冰厚度分布，给定表观物质平衡（apparent mass balance）。</dd>
+<dd class="see">参见：Mass-conservation inversion（质量守恒反演）、Apparent mass balance（表观物质平衡）、inversion_output.pkl</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-l">L</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Lapse rate</strong> <span class="zh">递减率</span></dt>
+<dd>大气温度随海拔降低的速率。在OGGM中，默认温度递减率为-6.5 K/km（<code>temp_default_gradient</code>）。递减率用于将气候数据从参考高度降尺度到冰川的海拔范围。</dd>
+<dd class="see">参见：Climate（气候）、temp_default_gradient、Refreezing（再冻结）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-m">M</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Mass balance (specific, annual, monthly)</strong> <span class="zh">物质平衡（比、年度、月度）</span></dt>
+<dd>特定时段内冰川质量的净变化（kg m⁻²）。<strong>比</strong>物质平衡是单位面积的质量变化。<strong>年度</strong>物质平衡是全年积分。<strong>月度</strong>物质平衡解析季节循环。OGGM的MassBalanceModel计算全部三种。</dd>
+<dd class="see">参见：MassBalanceModel、get_monthly_mb、get_annual_mb、get_specific_mb</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Mass balance gradient</strong> <span class="zh">物质平衡梯度</span></dt>
+<dd>物质平衡随海拔的变化率（kg m⁻²每米高度）。更陡的梯度意味着低海拔处更多的消融和/或高海拔处更多的积累。该梯度是校准后温度指数模型（temperature-index model）的一个涌现属性。</dd>
+<dd class="see">参见：Mass balance（物质平衡）、Temperature index model（温度指数模型）、ELA（平衡线高度）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Mass-conservation inversion</strong> <span class="zh">质量守恒反演</span></dt>
+<dd>OGGM计算冰厚度的主要方法。它求解连续性方程：d(flux)/dx = (apparent mass balance) * width，求解冰厚H，利用SIA将通量与H关联。结果是一个满足质量守恒的物理一致性厚度剖面。</dd>
+<dd class="see">参见：Inversion（反演）、Apparent mass balance（表观物质平衡）、mass_conservation_inversion</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>melt_f (Melt factor)</strong> <span class="zh">融化因子</span></dt>
+<dd>温度指数融化因子（temperature-index melt factor；kg m⁻² K⁻¹ day⁻¹）：每个正温度日对应的融化量。melt_f是OGGM物质平衡模型中的主要可校准参数，通常通过大地测量或原位物质平衡观测约束。</dd>
+<dd class="see">参见：Temperature index model（温度指数模型）、Degree-day model（度日模型）、mb_calib.json</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>MixedBedFlowline</strong> <span class="zh">混合基底流线</span></dt>
+<dd>Flowline的子类，处理混合冰床形状：矩形、梯形和抛物线形截面。冰床横截面形状（bed cross-section geometry）影响冰厚度与截面积之间的关系，进而影响通量和动力学响应。</dd>
+<dd class="see">参见：Flowline（流线）、model_flowlines.pkl、Bed topography（冰床地形）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Multiple flowlines</strong> <span class="zh">多流线</span></dt>
+<dd>OGGM对有多个支流的冰川建模方法：每个支流被建模为单独的一维流线，在交汇处进行质量交换。由<code>cfg.PARAMS['use_multiple_flowlines']</code>控制。替代方案是单个合并流线。</dd>
+<dd class="see">参见：Flowline（流线）、Tributary（支流）、use_multiple_flowlines</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-o">O</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>OGGM (Open Global Glacier Model)</strong> <span class="zh">开放全球冰川模型</span></dt>
+<dd>一个开源、社区驱动的冰川建模框架。OGGM提供从RGI轮廓到动力学模拟的完整管线，采用模块化设计，可在每个层面进行定制。用Python编写，基于xarray、salem和rasterio构建。</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-p">P</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>params.cfg</strong> <span class="zh">参数配置文件</span></dt>
+<dd>存储OGGM所有可调参数的中央配置文件。按章节组织（输入输出、网格、气候、动力学、崩解等）。用户可以通过提供自己的params.cfg或通过<code>cfg.PARAMS['param_name'] = value</code>编程方式覆盖默认值。</dd>
+<dd class="see">参见：cfg.initialize、cfg.PARAMS、附录B</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Prepro level (Preprocessing level)</strong> <span class="zh">预处理级别</span></dt>
+<dd>表示冰川目录（GlacierDirectory）已完成的处理步骤的位掩码：0=原始（仅轮廓），1=GIS任务完成，2=中心线完成，3=气候完成，4=反演完成。由<code>init_glacier_directories(from_prepro_level=N)</code>用于从某一阶段恢复。</dd>
+<dd class="see">参见：GlacierDirectory（冰川目录对象）、init_glacier_directories、diagnostics.json</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>PRCP (Precipitation)</strong> <span class="zh">降水</span></dt>
+<dd>在OGGM中，降水以月总量形式存储在气候文件中（kg m⁻² month⁻¹）。温度决定固液比例，固态降水贡献于积累，液态降水假设立即流出。</dd>
+<dd class="see">参见：Accumulation（积累）、Climate（气候）、temp_melt、prcp_fac</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-r">R</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>RGI (Randolph Glacier Inventory)</strong> <span class="zh">伦道夫冰川编目</span></dt>
+<dd>全球完整的冰川轮廓清单，为OGGM模拟提供边界条件。每个冰川是一个多边形，包含面积、质心坐标和末端类型等元数据。OGGM支持RGI 6.0和7.0版本。</dd>
+<dd class="see">参见：RGIId、outlines.shp、rgi_version</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>RGIId</strong> <span class="zh">伦道夫冰川编目标识符</span></dt>
+<dd>RGI中每个冰川的14字符唯一标识符。格式：RGI60-RR.SSSSS，其中RR是区域代码，SSSSS是该区域内的5位序列号。示例：RGI60-11.00897（阿尔卑斯山的Hintereisferner冰川）。</dd>
+<dd class="see">参见：RGI（伦道夫冰川编目）、GlacierDirectory.rgi_id</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-s">S</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>SIA (Shallow Ice Approximation)</strong> <span class="zh">浅冰近似</span></dt>
+<dd>对冰川流动完整Stokes方程的一种简化，当水平尺度远大于冰厚（纵横比远小于1）时有效。在SIA中，冰流仅由局部表面坡度驱动，纵向应力梯度被忽略。OGGM的流线模型基于SIA构建。</dd>
+<dd class="see">参见：Ice dynamics（冰动力学）、Flowline model（流线模型）、Diffusivity（扩散系数）、Glen's law（格伦定律）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Solid precipitation</strong> <span class="zh">固态降水</span></dt>
+<dd>以雪形式降落的降水，贡献于积累。在OGGM的温度指数模型（temperature-index model）中，固态比例在temp_all_solid和temp_all_liq之间从1（全部固态）过渡到0（全部液态）。</dd>
+<dd class="see">参见：Accumulation（积累）、PRCP（降水）、temp_all_solid、temp_all_liq</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Specific mass balance (SMB)</strong> <span class="zh">比物质平衡</span></dt>
+<dd>冰川整体平均物质平衡，通常以每年毫米水当量（water equivalent, w.e.; mm w.e. yr⁻¹）或kg m⁻² yr⁻¹表示。SMB通过对冰川高度-面积分布积分物质平衡剖面计算。</dd>
+<dd class="see">参见：Mass balance（物质平衡）、get_specific_mb、dmdtda_mmwea</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Spinup</strong> <span class="zh">预热</span></dt>
+<dd>模型初始化或预热过程。参见<strong>Dynamic spinup（动态预热）</strong>。</dd>
+<dd class="see">参见：Dynamic spinup（动态预热）、run_dynamic_spinup</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Step (model step)</strong> <span class="zh">时间步进</span></dt>
+<dd>流线模型的一个时间步长。<code>FluxBasedModel.step(dt)</code>方法将冰川几何向前推进dt年，求解SIA方程。自适应时间步长意味着实际dt可能小于请求值以满足CFL条件。</dd>
+<dd class="see">参见：FluxBasedModel、CFL condition（CFL条件）、Adaptive time-stepping（自适应时间步长）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Surface elevation</strong> <span class="zh">表面高程</span></dt>
+<dd>冰川表面的海拔（m a.s.l.），由DEM测量获得。surface_h是每个Flowline对象中的关键数组，是约束反演和模型的主要观测量。</dd>
+<dd class="see">参见：Flowline（流线）、DEM（数字高程模型）、Bed topography（冰床地形）、surface_h</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Surge</strong> <span class="zh">冰川跃动</span></dt>
+<dd>冰川流速在较短时间（数月到数年）内急剧加速的现象，通常以多个十年为周期发生在跃动型冰川上。OGGM不明确建模冰川跃动；跃动型冰川可能需要特殊处理（例如从物质平衡校准中排除）。</dd>
+<dd class="see">参见：Tidewater glacier（入海型冰川）、Terminus（末端）</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-t">T</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Temperature index model (TI model)</strong> <span class="zh">温度指数模型（temperature-index model）</span></dt>
+<dd>一类将融化与温度相关联的物质平衡模型。OGGM的<code>MonthlyTIModel</code>是月度温度指数模型（MonthlyTIModel, temperature-index model），融化与月均正温度成正比，积累是固态降水部分。该模型有一个主要可校准参数：melt_f。</dd>
+<dd class="see">参见：Degree-day model（度日模型）、MonthlyTIModel、melt_f（融化因子）、Mass balance（物质平衡）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>temp_bias</strong> <span class="zh">温度偏差</span></dt>
+<dd>校准参数：施加于气候时间序列的温度偏差（K），使模拟的物质平衡与观测一致。temp_bias用于校正气候数据集中的系统偏差。</dd>
+<dd class="see">参见：mb_calib.json、melt_f（融化因子）、prcp_fac</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>temp_melt</strong> <span class="zh">融化温度阈值</span></dt>
+<dd>融化计算使用的温度阈值（°C）。OGGM v1.6.3默认值为-1.0°C。降水固液相比例由<code>temp_all_solid</code>和<code>temp_all_liq</code>控制，而不是由<code>temp_melt</code>控制。</dd>
+<dd class="see">参见：Solid precipitation（固态降水）、temp_all_solid、temp_all_liq</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Terminus</strong> <span class="zh">末端/冰舌</span></dt>
+<dd>冰川的下游终点。末端类型（陆地、海洋、湖泊、冰架）决定适用哪些过程：陆地终止型冰川仅经历融化；海洋终止型冰川还经历崩解和海底融化。末端类型记录在RGI中。</dd>
+<dd class="see">参见：Tidewater glacier（入海型冰川）、Calving（崩解）、TermType、terminus_type</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Tidewater glacier</strong> <span class="zh">入海型冰川</span></dt>
+<dd>其末端到达海洋（或大型湖泊）的冰川，通过崩解和海底融化失去质量。OGGM对入海型冰川进行特殊处理：激活崩解参数化，反演中考虑海平面以下冰床的可能性。</dd>
+<dd class="see">参见：Calving（崩解）、Terminus（末端）、is_tidewater、calving_k</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Tributary</strong> <span class="zh">支流/支冰川</span></dt>
+<dd>汇入较大主干冰川的较小冰川分支。在OGGM中，支流在中心线计算期间被检测到，可以建模为在交汇点处向主流线贡献质量的独立流线。</dd>
+<dd class="see">参见：Centerline（中心线）、Flowline（流线）、Multiple flowlines（多流线）、flows_to</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>t_star</strong> <span class="zh">参考年份</span></dt>
+<dd>物质平衡校准的参考年份：历史记录中模拟物质平衡等于参考（大地测量）物质平衡的年份。t_star在校准期间计算，用于锚定时间序列。</dd>
+<dd class="see">参见：mb_calib.json、Mass balance calibration（物质平衡校准）、temp_bias</dd>
+</dl>
+
+<!-- ================================================================== -->
+<h2 id="sec-w">W</h2>
+<!-- ================================================================== -->
+<dl class="glossary-entry">
+<dt><strong>Widths (glacier widths)</strong> <span class="zh">冰川宽度</span></dt>
+<dd>冰川沿流线各点的截面宽度（m）。宽度从面积-海拔分布计算得出，对质量守恒至关重要：给定厚度下，更宽的截面承载更多的通量。存储为<code>fl.widths</code>（在网格中心）和<code>fl.widths_m</code>（在交错网格点上）。</dd>
+<dd class="see">参见：Flowline（流线）、initialize_flowlines、Hypsometry（高度-面积分布）</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Workflow</strong> <span class="zh">工作流</span></dt>
+<dd>OGGM的编排层（<code>oggm.workflow</code>），协调多个冰川上实体任务（entity task）的执行。提供初始化、任务执行和结果汇总等函数。工作流模块透明地处理多进程、日志和错误恢复。</dd>
+<dd class="see">参见：Entity task（实体任务）、execute_entity_task、init_glacier_directories</dd>
+</dl>
+
+<dl class="glossary-entry">
+<dt><strong>Working directory</strong> <span class="zh">工作目录</span></dt>
+<dd>所有OGGM数据的根目录，通过<code>cfg.PATHS['working_dir']</code>设置。包含各单个冰川数据（<code>per_glacier/</code>）、气候数据、DEM瓦片和日志文件的子目录。</dd>
+<dd class="see">参见：cfg.initialize、cfg.PATHS、GlacierDirectory（冰川目录对象）</dd>
+</dl>
+
+<h2>D.2 补充术语（快速参考）</h2>
+
+<table>
+<thead><tr><th>术语</th><th>中文</th><th>简要定义</th></tr></thead>
+<tbody>
+<tr><td>Absolute tolerance</td><td>绝对容差</td><td>数值比较中允许的最大绝对误差（atol）</td></tr>
+<tr><td>Adaptive time-stepping</td><td>自适应时间步长</td><td>自动调整dt以满足CFL条件</td></tr>
+<tr><td>Boundary condition</td><td>边界条件</td><td>域边界的约束；OGGM在末端使用零厚度边界</td></tr>
+<tr><td>Divergence</td><td>散度</td><td>d(flux)/dx：冰通量沿流线的空间变化</td></tr>
+<tr><td>Fjord</td><td>峡湾</td><td>入海型冰川通常终止的狭窄海洋入口</td></tr>
+<tr><td>Flotation</td><td>浮力/漂浮</td><td>当冰厚小于浮力阈值时（H &lt; rho_w/rho_i * D）</td></tr>
+<tr><td>Geodetic mass balance</td><td>大地测量物质平衡（geodetic mass balance）</td><td>通过重复DEM差分测量得到的质量变化</td></tr>
+<tr><td>GeoTIFF</td><td>地理标记TIFF</td><td>嵌入地理参考信息的TIFF栅格（CRS, geotransform）</td></tr>
+<tr><td>Glacier mask</td><td>冰川掩膜</td><td>表示哪些单元属于冰川（1）或不属于（0）的二值网格</td></tr>
+<tr><td>Interpolation</td><td>插值</td><td>从离散采样估计中间点值（如不同高度上的气候值）</td></tr>
+<tr><td>Land-terminating</td><td>陆地终止型</td><td>末端位于陆地上的冰川（RGI中TermType=0）</td></tr>
+<tr><td>LEGOS</td><td>LEGOS格式</td><td>崩解模块中使用的内部类（sandbox）</td></tr>
+<tr><td>Logging</td><td>日志</td><td>OGGM使用Python的logging模块；级别由cfg.set_logging_config设置</td></tr>
+<tr><td>Marine-terminating</td><td>海洋终止型</td><td>末端到达海洋的冰川（RGI中TermType=1）</td></tr>
+<tr><td>NetCDF</td><td>网络通用数据格式</td><td>自描述二进制科学网格数据格式；OGGM广泛使用</td></tr>
+<tr><td>Pickle</td><td>序列化</td><td>Python的二进制序列化格式，用于存储任意对象</td></tr>
+<tr><td>prcp_fac</td><td>降水修正因子</td><td>校准期间降水的乘法校正因子</td></tr>
+<tr><td>PROJ.4</td><td>坐标参考系统</td><td>坐标参考系规范字符串格式</td></tr>
+<tr><td>Relaxation</td><td>松弛</td><td>用于稳定迭代解的数值技术</td></tr>
+<tr><td>Relative tolerance</td><td>相对容差</td><td>数值比较中允许的最大相对误差（rtol）</td></tr>
+<tr><td>Salem</td><td>Salem库</td><td>OGGM用于网格和地图操作的地理空间库</td></tr>
+<tr><td>Shapefile</td><td>矢量文件</td><td>ESRI地理空间矢量数据格式（多边形、点、线）</td></tr>
+<tr><td>Shop</td><td>数据商店</td><td>OGGM的模块化数据提供系统（oggm.shop.*）</td></tr>
+<tr><td>Smoothing</td><td>平滑</td><td>应用空间滤波器去除噪声；用于反演输出滤波</td></tr>
+<tr><td>SRTM</td><td>航天雷达地形测绘任务</td><td>航天雷达地形任务DEM；OGGM的默认高程数据源</td></tr>
+<tr><td>Staggered grid</td><td>交错网格</td><td>变量定义在单元边缘（widths_m）与单元中心（widths）的网格</td></tr>
+<tr><td>Steady state</td><td>稳态</td><td>不随时间变化的系统状态（dH/dt = 0）</td></tr>
+<tr><td>Thermal regime</td><td>热力状态</td><td>冰川内部温度分布；在OGGM中进行了简化</td></tr>
+<tr><td>Volume (glacier volume)</td><td>冰川体积</td><td>冰总体积（m³或km³）；volume_km3是关键模型输出</td></tr>
+<tr><td>w.e. (water equivalent)</td><td>水当量（water equivalent, w.e.）</td><td>以等效水深表示的质量；换算：1 kg m⁻² = 1 mm w.e.</td></tr>
+<tr><td>xarray</td><td>xarray库</td><td>标记多维数组的Python库；OGGM的主要数据容器</td></tr>
+<tr><td>Zero-thickness boundary</td><td>零厚度边界</td><td>冰川末端H=0；关键的模型边界条件</td></tr>
+</tbody>
+</table>
+
+<div class="chapter-nav">
+  <a href="appendix_c.html">← 附录C 文件格式参考</a>
+  <span></span>
+</div>
+
+<footer>
+  OGGM 源码深度解析 &mdash; 附录D 术语表 (Glossary)
+</footer>
+
+</body>
+</html>

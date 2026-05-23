@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第13章 动态预热（dynamic spinup）与模型初始化 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第13章 动态预热（dynamic spinup）与模型初始化</h1>
+
+<p>
+<code>dynamic_spinup.py</code> 中的<code>run_dynamic_spinup</code>（约第38行）用来缓解OGGM动力学初始化中的路径依赖问题：反演、几何参数化和物质平衡建模通常以RGI编制年份附近的观测几何为约束，但冰川并不是在该年份才开始演化。若直接从观测几何启动正演模型，模型会在初期产生由初始化不一致引起的瞬态响应。动态预热（dynamic spinup）通过在近期历史气候下寻找与观测面积或体积相匹配的初始状态，降低这类非物理的初始冲击。
+</p>
+
+<div class="callout tip">
+  <div class="callout-title">一句话理解动态预热（dynamic spinup）</div>
+  <p>动态预热（dynamic spinup）不是为了把冰川“调到平衡”，而是为了找一个近期历史下更合理的初始状态，使模型在RGI日期附近的面积或体积接近观测，减少正演一开始的非物理跳变。</p>
+</div>
+
+<div class="callout warning">
+  <div class="callout-title">使用前检查</div>
+  <p>动态预热（dynamic spinup）计算成本高，并且解不唯一。区域研究中应记录成功率、目标变量、<code>spinup_period</code>、温度偏差和最终不匹配；失败冰川不应悄悄混入区域统计。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>13.1 问题陈述</h2>
+
+<p>
+冰川的动力演化是<strong>路径依赖</strong>的——当前状态不仅取决于当前气候，还取决于到达当前状态的历史路径。例如：
+</p>
+
+<ul>
+  <li>一条冰川从小冰期（LIA，约1850年）至今退缩了2 km——当前的冰厚分布包含了19-20世纪的退缩历史信息。</li>
+  <li>如果简单地从RGI年份开始模拟，模型会从"零历史"状态响应第一个时间步的MB强迫——这在前几年产生完全的瞬态响应（错误的高速率变化），而非真实的、已经在长期演化中部分达到平衡的响应。</li>
+</ul>
+
+<p>
+动态预热（dynamic spinup）的目标是：<strong>在给定预热（spinup）时段内寻找合适的温度偏差，使模型从候选初始状态出发并经过历史强迫后，在目标年份匹配RGI附近的观测面积或体积。</strong> 这不是唯一解；它是一种实用的初始化约束。
+</p>
+
+<!-- ================================================================== -->
+<h2>13.2 run_dynamic_spinup（第29行）</h2>
+
+<h3>13.2.1 总体算法结构</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">run_dynamic_spinup</span>(<span class="dec">gdir</span>, <span class="dec">**kwargs</span>):
+    <span class="cmt"># 步骤1: 确定目标年份</span>
+    target_yr = gdir.rgi_date + <span class="dec">1</span>
+
+    <span class="cmt"># 步骤2: 加载初始流线（反演结果）</span>
+    init_flowlines = load_inversion_flowlines(gdir)
+
+    <span class="cmt"># 步骤3: 设置两个MB模型</span>
+    mb_historical = MonthlyTIModel(gdir)   <span class="cmt"># 历史时期的气候强迫</span>
+    mb_spinup = ConstantMassBalance(...)   <span class="cmt"># 预热（spinup）时期的常量气候近似</span>
+
+    <span class="cmt"># 步骤4: 定义参考值（观测目标）</span>
+    <span class="cmt">#         可以是 area_m2 或 volume_m3（取决于 minimise_for 参数）</span>
+    ref_value = get_reference_from_flowlines(init_flowlines)
+
+    <span class="cmt"># 步骤5: 调用核心优化循环</span>
+    t_bias, spinup_years = minimise_with_spline_fit(
+        ref_value, target_yr, ...)
+
+    <span class="cmt"># 步骤6: 用最佳参数完成spinup</span>
+    run_final_spinup(t_bias, spinup_years)</code></pre>
+
+<h3>13.2.2 目标年份与参考值</h3>
+
+<p>
+<code>target_yr</code> 默认为 <code>gdir.rgi_date + 1</code>。RGI日期来自冰川目录（GlacierDirectory）中的清查年份，不同冰川并不相同；加一年是OGGM内部将清查几何与模型年份对齐时采用的约定。
+
+参考指标由 <code>minimise_for</code> 参数控制：
+</p>
+<ul>
+  <li><code>'area'</code>：使用冰川面积作为匹配指标。面积是卫星影像中最直接的观测量。</li>
+  <li><code>'volume'</code>：使用冰川体积。体积与反演的不确定性较大，但某些研究偏好此选项。</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>13.3 核心优化循环：minimise_with_spline_fit（第503行）</h2>
+
+<h3>13.3.1 优化问题的定义</h3>
+
+<p>
+目标：找到温度偏差 <code>t_spinup</code> （相对于参考气候的温度偏移），使得经过预热（spinup）时期后的冰川状态与观测匹配：
+</p>
+
+<pre><code><span class="cmt"># 优化问题：find t_spinup such that mismatch(t_spinup) = 0</span>
+mismatch = (simulated - observed) / observed   <span class="cmt"># 相对不匹配</span>
+
+<span class="cmt"># t_spinup > 0: 更暖的预热（spinup）气候 → 更小的冰川 → 更小的最终面积/体积</span>
+<span class="cmt"># t_spinup < 0: 更冷的预热（spinup）气候 → 更大的冰川</span></code></pre>
+
+<h3>13.3.2 边界安全机制</h3>
+
+<p>
+优化过程中内置了两个安全边界：
+</p>
+
+<pre><code><span class="cmt"># 安全检查1: 冰川消失 → 太暖</span>
+<span class="kw">if</span> glacier_area == <span class="dec">0</span> <span class="kw">after</span> <span class="dec">spinup</span>:
+    lower_bound = t_spinup + <span class="dec">0.5</span>   <span class="cmt"># 缩小搜索范围，偏向更冷</span>
+
+<span class="cmt"># 安全检查2: 冰川超出域范围 → 太冷</span>
+<span class="kw">if</span> glacier_exceeds_domain:
+    upper_bound = t_spinup - <span class="dec">0.5</span>   <span class="cmt"># 缩小搜索范围，偏向更暖</span></code></pre>
+
+<p>
+<strong>域范围超出</strong>指的是冰川增长超过了当前流线或DEM缓冲域可以可靠表示的范围。它并不等价于真实冰流绝不可能越过某条算法边界，而是数值域和几何输入已经不足以支撑继续外推。这个安全检查通过限制优化中的<code>t_spinup</code>上限来防止该情况。
+</p>
+
+<h3>13.3.3 步长限制</h3>
+
+<pre><code><span class="cmt"># t_spinup_max_step_length 限制了每次迭代的调整量（默认2°C）</span>
+delta_t = min(spline_prediction - current_t, t_spinup_max_step_length)
+<span class="cmt"># 避免大幅度的温度跳跃，防止优化发散</span></code></pre>
+
+<p>
+这个限制防止了优化器在迭代早期对高温偏差做出过大的修正。冰川动力学对温度的响应是高度非线性的，2°C的步长限制确保每一步的冰川状态变化在可控范围内，不会从存在状态直接跳到消失状态。
+</p>
+
+<h3>13.3.4 样条拟合与零值预测</h3>
+
+<p>
+优化器使用一阶样条将(mismatch, t_spinup)的采样点对拟合起来，然后用插值预测零不匹配点的温度偏差：
+</p>
+
+<pre><code><span class="cmt"># 样条拟合（第560行附近）</span>
+tck = interpolate.splrep(mismatches, t_spinups, k=<span class="dec">1</span>)   <span class="cmt"># 一阶样条</span>
+t_predicted = interpolate.splev(<span class="dec">0</span>, tck)            <span class="cmt"># 预测零不匹配点的t_spinup</span>
+
+<span class="cmt"># 收敛条件：|mismatch| < precision_percent（默认1%）</span>
+<span class="kw">if</span> abs(mismatch) &lt; precision_percent / <span class="dec">100</span>:
+    converged = <span class="dec">True</span></code></pre>
+
+<p>
+一阶样条（分段线性）在这里比高阶样条更适用，因为mismatch-t_spinup关系的形状在较大温度范围内可能高度弯曲，用简单线性拟合和逐步收敛比用高阶全局插值更稳健。
+</p>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout expert">
+  <div class="callout-title">为什么用样条而非牛顿法？</div>
+  <p>
+    冰川的mismatch-t_spinup函数没有闭合形式，每次函数求值都需要完成一次动态模拟。牛顿法需要导数估计，但在存在数值噪声和函数不连续（如域超出导致的突然变化）时表现不稳定。样条拟合方法通过"采样-拟合-预测"循环在不确定性下更稳健，同时将求值次数保持在可控范围内。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>13.4 Spinup时期试验循环（第831行）</h2>
+
+<p>
+对某些冰川，可能不存在使冰川在spinup期中保持存在的同时达到观测大小的温度偏差。此时，OGGM尝试多个（最多3个）逐渐缩短的预热（spinup）时期：
+</p>
+
+<pre><code><span class="cmt"># 试验1: 使用默认的或用户指定的spinup_period</span>
+<span class="kw">for</span> period <span class="kw">in</span> [period_<span class="dec">1</span>, period_<span class="dec">2</span>, period_<span class="dec">3</span>]:
+    <span class="kw">try</span>:
+        t_bias = minimise_with_spline_fit(period=period, ...)
+        <span class="kw">break</span>   <span class="cmt"># 成功找到符合条件的t_bias</span>
+    <span class="kw">except</span> SpinupFailed:
+        <span class="cmt"># 尝试更短的时期</span>
+        period = max(period / <span class="dec">2</span>, min_spinup_period)
+
+<span class="cmt"># 兜底方案：ignore_errors=True → 不使用spinup</span>
+<span class="kw">if</span> all_periods_failed <span class="kw">and</span> ignore_errors:
+    save_without_spinup(gdir)</code></pre>
+
+<p>
+更短的预热（spinup）时期意味着预热（spinup）气候对冰川的影响时间更短，冰川离观测状态更近——因此更容易找到匹配的<code>t_spinup</code>。但过短的时期意味着预热（spinup）获得的"历史记忆"有限，降低了动态预热（dynamic spinup）的效用。
+</p>
+
+<!-- ================================================================== -->
+<h2>13.5 关键参数</h2>
+
+<p>
+dynamic_spinup.py定义了约49个参数，其中最关键的有：
+</p>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>默认值</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>spinup_period</code></td><td>20 年</td><td>Spinup时期长度；若设置<code>spinup_start_yr</code>则被后者覆盖</td></tr>
+    <tr><td><code>min_spinup_period</code></td><td>10 年</td><td>初次尝试失败时允许缩短到的最小预热（spinup）时期</td></tr>
+    <tr><td><code>minimise_for</code></td><td>'area'</td><td>匹配指标（area 或 volume）</td></tr>
+    <tr><td><code>precision_percent</code></td><td>1%</td><td>相对不匹配收敛容差</td></tr>
+    <tr><td><code>precision_absolute</code></td><td>变化</td><td>绝对不匹配收敛容差</td></tr>
+    <tr><td><code>first_guess_t_spinup</code></td><td>-2.0</td><td>温度偏差初始猜测 (°C)</td></tr>
+    <tr><td><code>t_spinup_max_step_length</code></td><td>2.0</td><td>每次迭代温度步长上限 (°C)</td></tr>
+    <tr><td><code>maxiter</code></td><td>30</td><td>优化最大迭代次数</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>13.6 融化因子校准</h2>
+
+<h3>13.6.1 dynamic_melt_f_run_with_dynamic_spinup（第948行）</h3>
+
+<p>
+这是将融化因子（melt_f）校准与动态预热（dynamic spinup）集成的核心函数。其流程是：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">dynamic_melt_f_run_with_dynamic_spinup</span>(<span class="dec">gdir</span>, <span class="dec">**kwargs</span>):
+    <span class="cmt"># 1. 更新融化因子</span>
+    update_melt_f(gdir, new_melt_f)
+
+    <span class="cmt"># 2. 用新的融化因子重新运行冰厚反演</span>
+    mass_conservation_inversion(gdir, glen_a=..., fs=...)
+
+    <span class="cmt"># 3. 用新的冰厚重新进行动态预热（dynamic spinup）</span>
+    run_dynamic_spinup(gdir, ...)
+
+    <span class="cmt"># 4. 计算大地测量物质平衡（geodetic mass balance）</span>
+    geodetic_mb = compute_geodetic_mb(gdir)
+
+    <span class="cmt"># 5. 检查是否收敛（大地测量MB匹配观测）</span>
+    <span class="kw">return</span> geodetic_mb_mismatch</code></pre>
+
+<p>
+这个流程的嵌套结构反映了OGGM中参数的高度耦合——融化因子<code>melt_f</code>的变化影响物质平衡（第8章），物质平衡影响反演的冰通量和冰厚（第9章），冰厚影响动态预热（dynamic spinup）的结果（本章），而预热（spinup）结果又影响后续模拟的物理一致性。
+</p>
+
+<h3>13.6.2 回退机制（第1239行）</h3>
+
+<pre><code><span class="kw">def</span> <span class="fn">dynamic_melt_f_run_with_dynamic_spinup_fallback</span>(<span class="dec">gdir</span>):
+    <span class="cmt"># 如果主校准失败，逐步回退：</span>
+    <span class="cmt"># 1. 尝试减少预热（spinup）时期</span>
+    <span class="cmt"># 2. 尝试不使用动态预热（dynamic spinup）</span>
+    <span class="cmt"># 3. 尝试使用预设的融化因子</span>
+    <span class="cmt"># 4. 完全放弃spinup（标记为no_spinup）</span></code></pre>
+
+<p>
+这个多层回退设计确保了对复杂冰川（如具有多条支流的入海型冰川，tidewater glacier）或数据不足的冰川，校准过程不会永久阻塞整个工作流。
+</p>
+
+<!-- ================================================================== -->
+<h2>13.7 设计模式分析</h2>
+
+<h3>13.7.1 嵌套优化</h3>
+
+<p>
+动态预热（dynamic spinup）本身是一个优化问题（寻找t_spinup），但当它嵌入融化因子校准时，形成了嵌套优化结构——外环优化melt_f，内环优化t_spinup。这种双级优化在计算上是昂贵的：对于每条冰川，内外环的每次迭代都需要完成一个完整的预热（spinup）模拟（可能100-200年）。20条冰川的完整嵌套校准可能需要数千个模型年。
+</p>
+
+<h3>13.7.2 闭包用于状态管理</h3>
+
+<p>
+<code>minimise_with_spline_fit</code> 内部使用Python闭包来管理优化状态——mismatch和t_spinup的历史值被闭包在一个可变字典中，避免了全局变量和线程安全问题：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">minimise_with_spline_fit</span>(...):
+    state = {<span class="str">'mismatches'</span>: [], <span class="str">'t_spinups'</span>: [], <span class="str">'iteration'</span>: <span class="dec">0</span>}
+
+    <span class="kw">def</span> <span class="fn">objective_function</span>(<span class="dec">t_spinup</span>):
+        mismatch = run_spinup_with_t_bias(t_spinup)
+        state[<span class="str">'mismatches'</span>].append(mismatch)
+        state[<span class="str">'t_spinups'</span>].append(t_spinup)
+        <span class="kw">return</span> mismatch
+
+    <span class="cmt"># 闭包保持了状态，而不需要类实例</span></code></pre>
+
+<h3>13.7.3 边界扩展</h3>
+
+<p>
+当优化器在初始猜测的<code>t_spinup</code>处评估不匹配，并且这个不匹配未能到达零值（例如，在初始范围内函数单调但不穿过零轴），边界扩展机制自动扩大t_spinup的搜索范围：
+</p>
+
+<pre><code><span class="cmt"># 如果所有样本点的mismatch同号 → 扩展边界</span>
+<span class="kw">if</span> all_mismatches_same_sign:
+    lower_bound -= <span class="dec">2</span>   <span class="cmt"># 进一步冷却搜索</span>
+    upper_bound += <span class="dec">2</span>   <span class="cmt"># 进一步加温搜索</span></code></pre>
+
+<!-- ================================================================== -->
+<h2>13.8 工作流集成</h2>
+
+<h3>13.8.1 预处理级别（prepro level）L4</h3>
+
+<p>
+动态预热（dynamic spinup）在<code>run_dynamic_melt_f_calibration</code>任务中触发，属于预处理级别（prepro level）L4（workflow.py）。这是OGGM工作流中的高阶任务，通常在基本反演（L3）之后执行。在L4中：
+</p>
+
+<ul>
+  <li>融化因子（melt_f）被校准以匹配大地测量MB。</li>
+  <li>动态预热（dynamic spinup）寻找与观测一致的初始条件。</li>
+  <li>校准后的温度偏差存储在<code>gdir</code>的diagnostics中。</li>
+</ul>
+
+<h3>13.8.2 与正演任务的衔接</h3>
+
+<p>
+动态预热（dynamic spinup）不是通过一个全局的<code>use_dynamic_spinup</code>开关隐式启用，而是由<code>run_dynamic_spinup</code>及其包装任务显式调用。成功后，任务会写出预热（spinup）后的模型状态，并在<code>gdir</code>诊断字典中记录温度偏差、目标年份和匹配误差；后续正演可以从这个初始化状态继续运行：
+</p>
+
+<pre><code><span class="cmt"># 运行动态预热（dynamic spinup）并保存初始化几何</span>
+model = dynamic_spinup.run_dynamic_spinup(
+    gdir,
+    output_filesuffix=<span class="str">'_dynamic_spinup'</span>,
+    store_model_evolution=<span class="kw">True</span>,
+)
+
+<span class="cmt"># 诊断信息写入gdir，可用于质量控制</span>
+diag = gdir.get_diagnostics()
+temp_bias = diag[<span class="str">'temp_bias_dynamic_spinup'</span>]
+period = diag[<span class="str">'dynamic_spinup_period'</span>]</code></pre>
+
+<!-- ================================================================== -->
+<h2>13.9 输出诊断</h2>
+
+<p>
+成功的动态预热（dynamic spinup）产生以下输出：
+</p>
+
+<table>
+  <thead>
+    <tr><th>诊断量</th><th>含义</th><th>用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>run_dynamic_spinup_success</code></td><td>是否成功完成动态预热（dynamic spinup）</td><td>批量模拟中的质量控制</td></tr>
+    <tr><td><code>temp_bias_dynamic_spinup</code></td><td>校准温度偏差 (°C)</td><td>记录找到的近期历史气候偏移</td></tr>
+    <tr><td><code>dynamic_spinup_target_year</code></td><td>匹配的目标年份</td><td>通常接近RGI日期或用户指定年份</td></tr>
+    <tr><td><code>dynamic_spinup_period</code></td><td>使用的预热（spinup）时期 (年)</td><td>记录spinup历史长度</td></tr>
+    <tr><td><code>dynamic_spinup_forward_model_iterations</code></td><td>正演模型调用次数</td><td>用于判断计算成本和收敛难度</td></tr>
+    <tr><td><code>area_mismatch_dynamic_spinup_km2_percent</code> 或 <code>volume_mismatch_dynamic_spinup_km3_percent</code></td><td>最终面积或体积不匹配 (%)</td><td>用于评估spinup质量</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>13.10 总结</h2>
+
+<p>
+<code>dynamic_spinup.py</code> 通过样条拟合优化和嵌套的气候-动力学校准，减小了OGGM动力学模拟中的初始化"shock"瞬态响应。它将静态的RGI快照转化为具有近期气候历史约束的动态初始条件。参数体系提供了细粒度控制，但核心逻辑保持清晰：通过调节温度偏差-不匹配函数找到使冰川状态与观测一致的气候强迫，然后保存对应的初始化模型状态和诊断信息。
+</p>
+
+<p>
+预热（spinup）是OGGM中计算成本最高的单冰川任务之一（每条冰川可能需数百个模型年的计算），但也是区分高质量动力学模拟与简单外推的关键步骤。随着区域到全球尺度的OGGM模拟越来越普及，动态预热（dynamic spinup）已成为标准预处理流程的必要组成部分。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch12.html">第12章：崩解参数化</a></span>
+  <span class="next"><a href="ch14.html">第14章：二维SIA模块</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

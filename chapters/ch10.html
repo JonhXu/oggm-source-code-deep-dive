@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第10章 冰流动力学：Flowline模型 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第10章 冰流动力学：Flowline模型</h1>
+
+<p>
+<code>flowline.py</code> 是OGGM中规模最大的单一源文件，约4853行，包含冰川动力学的主要实现：从冰床横截面形状（bed cross-section geometry）参数化到SIA方程数值求解，再到多种演化模型的构建。本章关注它如何把第9章反演的冰厚作为初始条件、把第8章的物质平衡作为气候强迫，进而驱动冰川随时间演化。
+</p>
+
+<div class="callout tip">
+  <div class="callout-title">初学者阅读路径</div>
+  <p>第一遍只需读懂三个对象：<code>Flowline</code>保存一维几何，<code>MassBalanceModel</code>提供气候强迫，<code>FlowlineModel</code>根据SIA推进冰川几何。冰床横截面（bed cross-section）类、支流通量合并（tributary flux merging）和求解器细节可以在能跑通教程6之后再回看。</p>
+</div>
+
+<div class="callout expert">
+  <div class="callout-title">模型假设边界</div>
+  <p>OGGM主工作流使用一维流线表达复杂山地冰川，并以SIA为核心动力学近似。它适合区域到全球尺度的大量冰川模拟，但不显式求解纵向应力、完整三维流场或复杂基底水文。解释个别陡峭冰瀑、跃动冰川或快速入海型冰川时，应把这些假设作为结果讨论的一部分。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>10.1 Flowline基础类</h2>
+
+<h3>10.1.1 Flowline类（第49行）</h3>
+
+<p>
+<code>Flowline</code> 是OGGM中冰川几何表示的核心数据结构，继承自 <code>Centerline</code> 并添加了冰厚相关的属性。每条Flowline代表冰川的一条分支——主流线或支流线——携带该分支沿线的所有物理状态（厚度、表面高程、宽度、体积、冰通量等）。
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">Flowline</span>(<span class="fn">Centerline</span>):
+    <span class="cmt"># 核心几何属性（从Centerline继承）</span>
+    <span class="cmt"># line: (n,)-形 numpy数组 — 沿流线的累积距离 (m)</span>
+    <span class="cmt"># nx: int — 网格点数</span>
+    <span class="cmt"># dx: float — 网格间距 (m)</span>
+
+    <span class="cmt"># 冰川状态属性</span>
+    thick = <span class="dec">None</span>          <span class="cmt"># (nx,)-形数组 — 冰厚 (m)</span>
+    surface_h = <span class="dec">None</span>      <span class="cmt"># (nx,)-形数组 — 表面高程 (m)</span>
+    widths = <span class="dec">None</span>         <span class="cmt"># (nx,)-形数组 — 表面宽度 (m)</span>
+    widths_m = <span class="dec">None</span>       <span class="cmt"># (nx,)-形数组 — 中间宽度（用于通量计算）</span>
+    section = <span class="dec">None</span>        <span class="cmt"># (nx,)-形数组 — 横截面积 (m2)</span>
+    bed_h = <span class="dec">None</span>          <span class="cmt"># (nx,)-形数组 — 冰床高程 (m)</span>
+
+    <span class="cmt"># 诊断属性</span>
+    volume_m3 = <span class="dec">None</span>      <span class="cmt"># 冰川总体积</span>
+    length_m = <span class="dec">None</span>       <span class="cmt"># 冰川总长度</span>
+    flux = <span class="dec">None</span>           <span class="cmt"># (nx,)-形数组 — 冰通量 (m3 s-1)</span>
+    is_rectangular = [...]  <span class="cmt"># bool 数组 — 每点的冰床横截面（bed cross-section）类型</span></code></pre>
+
+<p>
+<code>surface_h</code> = <code>bed_h + thick</code>，这是基本的几何关系。但<code>surface_h</code>不保证处处大于<code>bed_h</code>——当冰厚为零时两者相等。
+<code>widths_m</code> 用于交错网格上的通量计算，定义在相邻格点之间（沿流线方向的半步点）。
+</p>
+
+<h3>10.1.2 冰床横截面形状（bed cross-section geometry）类层级</h3>
+
+<p>
+冰床横截面（bed cross-section）的形状决定了冰流通过横截面的方式，这是SIA理论中形状因子（shape factor）<code>f_d</code>的来源。OGGM定义了四种冰床横截面形状（bed cross-section geometry）类，构成一个功能递进的层级：
+</p>
+
+<h4>ParabolicBedFlowline（第301行）</h4>
+
+<p>
+抛物线形冰床横截面（bed cross-section）是最经典的冰川沟谷表示，对应于Nye (1965)和Cuffey &amp; Paterson (2010)的经典处理：
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">ParabolicBedFlowline</span>(<span class="fn">Flowline</span>):
+    <span class="cmt"># 宽度由抛物线公式给出：w = sqrt(4 * h / bed_shape)</span>
+    <span class="cmt"># bed_shape 是抛物线曲率参数</span>
+    <span class="cmt"># 横截面积：section = (2/3) * w * h</span>
+    <span class="cmt"># 形状因子（shape factor） f_d = 0.5</span></code></pre>
+
+<p>
+抛物线的几何含义：对于给定的冰厚h，宽度w由抛物线曲率参数<code>bed_shape</code>决定。w和h呈平方根关系，意味着冰厚的增厚会导致宽度的渐进式扩展。横截面积为<code>(2/3)*w*h</code>，形状因子（shape factor）固定为0.5——这是半圆冰床横截面（bed cross-section）的理论值，SIA形状因子（shape factor）恰好等于抛物线面积与等效矩形面积之比。
+</p>
+
+<h4>RectangularBedFlowline（第347行）</h4>
+
+<pre><code><span class="kw">class</span> <span class="fn">RectangularBedFlowline</span>(<span class="fn">Flowline</span>):
+    <span class="cmt"># section = w * h  （矩形面积）</span>
+    <span class="cmt"># 形状因子（shape factor） f_d = 1.0</span>
+    <span class="cmt"># 无侧向约束——全部应力由冰床承担</span></code></pre>
+
+<p>
+矩形冰床横截面（bed cross-section）假设侧壁垂直，并在一维SIA框架中不显式表示侧向阻力。这种假设适用于横向约束较弱的宽阔冰体；若用于狭窄山谷冰川，可能高估冰流速度。
+</p>
+
+<h4>TrapezoidalBedFlowline（第394行）</h4>
+
+<pre><code><span class="kw">class</span> <span class="fn">TrapezoidalBedFlowline</span>(<span class="fn">Flowline</span>):
+    <span class="cmt"># 宽度随冰厚线性增长：w = w0 + lambda * h</span>
+    <span class="cmt"># lambda 是梯形张开参数（无量纲）</span>
+    <span class="cmt"># 横截面积：section = (w + w0) / 2 * h</span>
+    <span class="cmt"># 形状因子（shape factor）随 w0/w 比值变化，介于0.5到1.0之间</span></code></pre>
+
+<p>
+梯形是更灵活的冰床横截面形状（bed cross-section geometry）表示，通过参数<code>lambda</code>（来自配置或反演中的<code>trapezoid_lambdas</code>）调整侧壁张开程度。<code>w0</code>表示冰床底部宽度。
+</p>
+
+<h4>MixedBedFlowline（第451行）——默认方案</h4>
+
+<pre><code><span class="kw">class</span> <span class="fn">MixedBedFlowline</span>(<span class="fn">Flowline</span>):
+    <span class="cmt"># 在每个网格点独立选择冰床横截面（bed cross-section）类型</span>
+    <span class="cmt"># is_trapezoid 布尔掩码区分应用哪种公式</span>
+    <span class="cmt"># 抛物线点：section = 2/3 * w * h, fd = 0.5</span>
+    <span class="cmt"># 梯形点：    section = (w+w0)/2 * h, fd = f(lambda)</span>
+    <span class="cmt"># 矩形点：    section = w * h, fd = 1.0</span></code></pre>
+
+<p>
+这是OGGM常用的冰床横截面形状（bed cross-section geometry）类。关键理念是：<strong>同一条冰川的不同位置可能需要不同的横截面表示。</strong>例如，在冰川上游宽阔盆地中梯形截面可能更合适，而在狭窄U形谷中抛物线截面可能更合适。<code>is_trapezoid</code>掩码允许逐格点切换公式，实现几何表示的灵活性。
+</p>
+
+<!-- ================================================================== -->
+<h2>10.2 FlowlineModel基类（第571行）</h2>
+
+<h3>10.2.1 构造函数</h3>
+
+<pre><code><span class="kw">class</span> <span class="fn">FlowlineModel</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="dec">self</span>, <span class="dec">flowlines</span>, <span class="dec">mb_model</span>=<span class="kw">None</span>, <span class="dec">glen_a</span>=<span class="kw">None</span>,
+                 <span class="dec">fs</span>=<span class="dec">0</span>, <span class="dec">mb_elev_feedback</span>=<span class="str">'annual'</span>):
+        <span class="cmt"># flowlines: Flowline对象列表（主流线 + 支流线）</span>
+        <span class="cmt"># mb_model: MassBalanceModel实例（气候强迫）</span>
+        <span class="cmt"># glen_a: Glen流动律参数 (Pa^-3 s^-1)，默认2.4e-24</span>
+        <span class="cmt"># fs: 基底滑动因子，默认0（无滑动）</span>
+        <span class="cmt"># mb_elev_feedback: 'annual','monthly','always','never'</span></code></pre>
+
+<p>
+模型的核心物理常数在构造时预计算：<code>_fd = 2 * glen_a / (n + 2)</code>（形变流参数，第653行）。这个预计算避免了在每个时间步中重复评估多项式。参数<code>fs</code>（基底滑动）在构造后通过<code>_fs</code>属性被类似处理。
+</p>
+
+<h3>10.2.2 支流系统（tributary system）：reset_flowlines()</h3>
+
+<p>
+<code>reset_flowlines()</code> 构建 <code>_tributary_indices</code>——一个记录每条支流线与主流线连接位置和方式的内部数据结构。支流贡献的冰通量通过<strong>高斯核</strong>分布在主流线上：
+</p>
+
+<pre><code><span class="cmt"># 支流通量在主流线上的贡献</span>
+<span class="cmt"># 分布核大小自适应：5, 7, 或 9 个格点</span>
+<span class="cmt"># 更宽的冰川 → 更大的核 → 更平滑的通量合并</span>
+<span class="kw">for</span> trib <span class="kw">in</span> tributary_flowlines:
+    junction_pos = trib.line[<span class="dec">-1</span>]          <span class="cmt"># 支流汇入主流线的位置</span>
+    kernel_width = adapt_to_glacier_size  <span class="cmt"># 自适应核宽度</span>
+    <span class="cmt"># 高斯权重分布到附近的主流线格点</span></code></pre>
+
+<p>
+高斯核的使用避免了支流通量集中到一个网格点导致的数值震荡。核大小的自适应逻辑考虑了冰川宽度——更宽的冰川下游使用9点核，更窄的山谷冰川使用5点核。
+</p>
+
+<h3>10.2.3 MB缓存策略</h3>
+
+<p>
+<code>mb_elev_feedback</code> 参数控制何时重新计算物质平衡：
+</p>
+
+<table>
+  <thead>
+    <tr><th>模式</th><th>行为</th><th>适用场景</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>'always'</code></td><td>每次需要MB时重新计算</td><td>物理精确但极慢</td></tr>
+    <tr><td><code>'monthly'</code></td><td>每个月重新计算一次（12次/年）</td><td>亚季节分辨率的模拟</td></tr>
+    <tr><td><code>'annual'</code></td><td>每年重新计算一次</td><td>常用折中：兼顾精度与性能</td></tr>
+    <tr><td><code>'never'</code></td><td>使用初始MB，永不更新</td><td>测试或教学目的</td></tr>
+  </tbody>
+</table>
+
+<p>
+缓存的核心设计逻辑是：在时间步之间，表面高程变化通常很小（典型值为每年几厘米到几米），因此每月或每年更新一次MB不会显著损失精度。通过跳过不必要的MB计算（尤其是基于气候数据的月度MB模型），性能可提升1-2个数量级。
+</p>
+
+<h3>10.2.4 时间步进：run_until()与run_until_and_store()</h3>
+
+<p>
+<code>run_until(y1)</code>（基本方法）将模型从当前时间向前积分到目标年份<code>y1</code>。它采用<strong>自适应时间步长</strong>策略：
+</p>
+
+<ul>
+  <li><strong>外层</strong>：按年份推进。每年开始时检查是否需要更新MB（取决于<code>mb_elev_feedback</code>模式）。</li>
+  <li><strong>内层</strong>：在每一年内，以月度步长推进（12步）。在每个月度步中，CFL条件可能触发进一步的子步分解。</li>
+</ul>
+
+<p>
+<code>run_until_and_store(y1)</code>（第922行）是<code>run_until</code>的扩展版本，将演化过程记录到<code>xarray.Dataset</code>中：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">run_until_and_store</span>(<span class="dec">self</span>, <span class="dec">y1</span>):
+    <span class="cmt"># 创建xarray Dataset，包含时间坐标</span>
+    ds = xr.Dataset(
+        coords={<span class="str">'time'</span>: [<span class="dec">self</span>.yr, y1]},
+    )
+    <span class="cmt"># 在每一步存储诊断变量</span>
+    <span class="cmt"># 变量包括：volume, area, length, ela, calving_rate</span>
+    <span class="cmt"># 每个变量是 shape=(time, flowline_idx, nx) 的DataArray</span>
+    <span class="kw">return</span> ds</code></pre>
+
+<p>
+存储的xarray Dataset使得后处理、可视化和分析变得非常方便——时间序列的体积变化、末端的进退、ELA的移动等都可以直接从Dataset中提取。
+</p>
+
+<h3>10.2.5 平衡态求解：run_until_equilibrium()（第1513行）</h3>
+
+<p>
+这个方法迭代运行模型直到冰川达到平衡态：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">run_until_equilibrium</span>(<span class="dec">self</span>, <span class="dec">rate</span>=<span class="dec">1e-3</span>):
+    <span class="kw">while</span> <span class="dec">True</span>:
+        V_before = <span class="dec">self</span>.volume_m3
+        <span class="dec">self</span>.run_until(<span class="dec">self</span>.yr + <span class="dec">1</span>)
+        V_after = <span class="dec">self</span>.volume_m3
+        <span class="kw">if</span> abs(V_after - V_before) / V_before &lt; <span class="dec">rate</span>:
+            <span class="kw">break</span>   <span class="cmt"># |dV/V| < 0.1% 时视为平衡</span></code></pre>
+
+<p>
+收敛判据通常基于体积的年际变化率。平衡态求解常用于：(1) 理想化预热（spinup）或平衡实验；(2) 敏感性实验；(3) 理论分析，即理解给定气候下冰川的平衡响应。第13章讨论的动态预热（dynamic spinup）并不简单等同于求平衡态，而是以观测面积或体积为目标进行近期历史初始化。
+</p>
+
+<!-- ================================================================== -->
+<h2>10.3 FluxBasedModel（第1568行）</h2>
+
+<h3>10.3.1 算法架构</h3>
+
+<p>
+<code>FluxBasedModel</code> 是OGGM的重要显式流线动力学模型。OGGM v1.6.3的配置文件默认<code>evolution_model</code>为<code>SemiImplicit</code>，但<code>FluxBasedModel</code>仍常用于多流线、崩解和需要显式通量处理的实验。它采用<strong>交错网格</strong>通量形式，每个时间步包含两个循环：
+</p>
+
+<p>
+<strong>循环1（通量计算，第1771-1866行）：</strong>
+</p>
+
+<pre><code><span class="kw">for</span> i <span class="kw">in</span> <span class="dec">range</span>(nx):
+    <span class="cmt"># 步骤1: 支流汇合 — 在交汇点附加下游表面高程</span>
+    append_tributary_surface_h()
+
+    <span class="cmt"># 步骤2: 崩解限制器 — 将水面以下冰厚截断</span>
+    <span class="kw">if</span> is_tidewater <span class="kw">and</span> bed_below_water:
+        thick = clip_to_water_level()
+
+    <span class="cmt"># 步骤3: 交错表面梯度</span>
+    slope_stag = (surface_h[i] - surface_h[i+<span class="dec">1</span>]) / dx
+
+    <span class="cmt"># 步骤4: 交错厚度（相邻格点平均）</span>
+    thick_stag = (thick[i] + thick[i+<span class="dec">1</span>]) / <span class="dec">2</span>
+
+    <span class="cmt"># 步骤5: SIA流速（形变 + 滑动）</span>
+    tau = rho * g * slope_stag   <span class="cmt"># 基底剪应力</span>
+    u_deform = thick_stag^(<span class="dec">n</span>+<span class="dec">1</span>) * fd * tau^<span class="dec">n</span>
+    u_sliding = thick_stag^(<span class="dec">n</span>-<span class="dec">1</span>) * fs * tau^<span class="dec">n</span>
+    u_total = u_deform + u_sliding
+
+    <span class="cmt"># 步骤6: 冰通量 = 流速 × 交错截面积</span>
+    flux_stag[i] = u_total * section_stag[i]
+
+<span class="cmt"># 步骤7: CFL条件 — 确定子时间步长</span>
+dt = cfl * dx / max_u   <span class="cmt"># cfl 默认为 0.02</span></code></pre>
+
+<p>
+<strong>循环2（质量重新分布，第1874-1971行）：</strong>
+</p>
+
+<pre><code><span class="kw">for</span> i <span class="kw">in</span> <span class="dec">range</span>(nx):
+    <span class="cmt"># 连续性方程：d(section)/dt = -div(flux) + mb</span>
+    new_section = section[i] \
+        + (flux_stag[i] - flux_stag[i+<span class="dec">1</span>]) * dt / dx \
+        + trib_flux_contribution * dt / dx \
+        + mb[i] * dt
+
+    <span class="cmt"># 截断：截面积不能为负</span>
+    new_section = max(<span class="dec">0</span>, new_section)
+
+    <span class="cmt"># 从截面积反算新厚度（取决于冰床横截面形状（bed cross-section geometry））</span>
+    new_thick = invert_section_to_thick(new_section, bed_shape)
+
+    <span class="cmt"># 通过高斯核向下游传递通量</span>
+    distribute_flux_downstream()</code></pre>
+
+<span class="tag tag-intermediate">中级</span>
+<div class="callout tip">
+  <div class="callout-title">CFL数0.02的含义</div>
+  <p>
+    FluxBasedModel使用非常保守的CFL数0.02。对于典型冰川流速（100 m/yr）和网格间距（200 m），这意味着dt ~ 0.04年，每年需要约25个时间步。与SemiImplicitModel的CFL 0.5相比，FluxBasedModel每个物理年需要更多的数值步，但每个步的计算量远少（无需矩阵求解）。
+  </p>
+</div>
+
+<h3>10.3.2 表面速度因子</h3>
+
+<p>
+SIA方程给出的是<strong>深度平均速度</strong>，但观测和诊断通常使用<strong>表面速度</strong>。两者之间的转换由经典冰川学关系给出：
+</p>
+
+<pre><code><span class="cmt"># 深度平均速度 → 表面速度的转换因子</span>
+_surf_vel_fac = (<span class="dec">n</span> + <span class="dec">2</span>) / (<span class="dec">n</span> + <span class="dec">1</span>)   <span class="cmt"># n=3 时 = 5/4 = 1.25</span></code></pre>
+
+<p>
+这个因子来源于SIA速度剖面的解析积分（Cuffey &amp; Paterson 2010, Eq. 8.34）。对于n=3，表面速度比深度平均速度高25%。在OGGM中，这个因子还可以乘以<code>cfg.PARAMS['surface_velocity_factor']</code>进行进一步的经验调整。
+</p>
+
+<!-- ================================================================== -->
+<h2>10.4 备选模型方案</h2>
+
+<h3>10.4.1 SemiImplicitModel（第2152行）</h3>
+
+<p>
+半隐式方案通过将SIA方程转换为扩散问题来获得更好的稳定性。核心是一种类似Crank-Nicolson的格式：
+</p>
+
+<pre><code><span class="cmt"># 扩散系数：D = (fd*h^(n+2) + fs*h^n) * rho*g * (w0+w)/2 * |dsdx|^(n-1)</span>
+<span class="cmt"># 对于纯形变流（fs=0）且抛物线冰床横截面（bed cross-section）：</span>
+<span class="cmt"># D = fd * h^(n+2) * rho*g * w * |dsdx|^(n-1)</span>
+
+<span class="cmt"># 三对角系统：d0[i]*S[i] + dm[i]*S[i-1] + dp[i]*S[i+1] = RHS</span>
+<span class="cmt"># 通过 scipy.linalg.solve_banded 求解</span></code></pre>
+
+<p>
+CFL条件从对流约束变为扩散约束：<code>dt &lt;= cfl * dx^2 / max(D/w)</code>，cfl约为0.5。这比FluxBasedModel的CFL 0.02大幅宽松，在空间网格较粗时半隐式模型可以省去很多子步。但代价是：(1) 需要构建和求解三对角矩阵；(2) <strong>仅支持单条流线</strong>（无支流系统（tributary system））。
+</p>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout expert">
+  <div class="callout-title">SemiImplicitModel的床高程修正项</div>
+  <p>
+    半隐式扩散方案的一个独特特征是包含了<strong>床高程修正项</strong>：<code>b_corr = -D * d(bed)/dx</code>。当冰床表面存在急剧的高程变化时（如反向坡度或冰瀑），这个项防止数值不稳定，确保质量守恒在变坡处保持精确。FluxBasedModel中这个效应的处理是隐式的（通过交错梯度），但SemiImplicitModel要求显式的修正项。
+  </p>
+</div>
+
+<h3>10.4.2 KarthausModel（第2067行）</h3>
+
+<p>
+KarthausModel是一个简化的显式方案，设计用于教学和概念验证。它直接从SIA计算流速和通量，使用简单的向前欧拉时间步进。默认参数经过调优使模型行为直观易懂，但物理精度不如FluxBasedModel。
+</p>
+
+<h3>10.4.3 MassRedistributionCurveModel（第2810行）</h3>
+
+<p>
+这是一个基于经验的方法，使用Huss et al. (2010)的delta-h参数化。核心思想是：
+</p>
+
+<pre><code><span class="cmt"># 冰川响应由经验的"质量重新分布曲线"参数化</span>
+<span class="cmt"># delta_h(z) = f(z, glacier_size_class)</span>
+<span class="cmt"># 曲线来自Huss等人对34条瑞士冰川的观测研究</span>
+mass_redistribution_curve_huss(...)   <span class="cmt"># 第3068行</span>
+
+<span class="cmt"># 三种前进方法（advance_method 0, 1, 2）</span>
+<span class="cmt"># 方法0：固定曲线，截面积被MB比例缩放</span>
+<span class="cmt"># 方法1：MB驱动冰川末端前进/后退</span>
+<span class="cmt"># 方法2：MB同时驱动厚度变化和末端变动</span></code></pre>
+
+<p>
+该方法完全跳过了SIA冰流计算，用统计规律代替了物理模拟。它的计算成本极低（每冰川每年只需几分之一秒），适用于数千到数万条冰川的集合模拟，但牺牲了物理精确性——无法表示冰流的动力学非线性反馈。
+</p>
+
+<h3>10.4.4 FileModel（第2658行）</h3>
+
+<p>
+FileModel是一个"鸭子类型"读取器，允许将之前存储的模拟输出重新加载为一个可查询的FlowlineModel。它不执行任何物理计算，而是提供与FlowlineModel相同的查询接口（volume, area, length等），方便后处理脚本的复用。
+</p>
+
+<!-- ================================================================== -->
+<h2>10.5 模型初始化与运行函数</h2>
+
+<h3>10.5.1 init_present_time_glacier（第3188行）</h3>
+
+<p>
+这是模型初始化的主入口。它负责：
+</p>
+
+<ol>
+  <li>加载反演的冰厚和流线。</li>
+  <li>调用 <code>decide_evolution_model</code>（第3342行）选择适当的动力学模型类。</li>
+  <li>处理崩解参数（如果适用）。</li>
+  <li>设置初始表面高程和体积。</li>
+  <li>可选：应用动态预热（dynamic spinup）的温度偏差校准。</li>
+</ol>
+
+<h3>10.5.2 decide_evolution_model（第3342行）</h3>
+
+<p>
+模型选择逻辑根据配置参数自动决定使用哪个模型类：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">decide_evolution_model</span>(<span class="dec">gdir</span>):
+    <span class="cmt"># 检查 cfg.PARAMS['evolution_model']</span>
+    <span class="cmt"># 可选值：'FluxBased', 'SemiImplicit', 'Karthaus',</span>
+    <span class="cmt">#         'MassRedistributionCurve', 'File'</span>
+<span class="cmt"># v1.6.3 params.cfg 默认：'SemiImplicit'</span></code></pre>
+
+<h3>10.5.3 顶层运行函数</h3>
+
+<p>
+OGGM提供了封装完整模拟流程的顶层函数：
+</p>
+
+<ul>
+  <li><code>flowline_model_run</code>（第3362行）：单条冰川的完整前向模拟，从初始化到指定结束年份。</li>
+  <li><code>run_from_climate_data</code>（第3786行）：使用GCM/RCM的气候数据驱动模拟。处理气候模型输出的网格化降水和温度场。</li>
+  <li><code>run_random_climate</code>（第3546行）：使用随机气候生成器进行不确定性量化或统计实验。</li>
+  <li><code>run_constant_climate</code>（第3670行）：使用固定气候（通常为参考期气候态）进行平衡态实验。</li>
+  <li><code>run_with_hydro</code>（第3939行）：耦合冰川动力学与水文模型，输出径流时间序列。</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>10.6 停止准则（第4371行）</h2>
+
+<p>
+模拟的终止由以下任一条件触发：
+</p>
+
+<table>
+  <thead>
+    <tr><th>准则</th><th>类型</th><th>描述</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>zero_glacier</code></td><td>消融完成</td><td>冰川体积降为0（某些区域可能保留多年冰）</td></tr>
+    <tr><td><code>spec_mb</code></td><td>超过气候范围</td><td>MB模型在其标定范围外被查询（如年MB超出+/-5 m w.e.）</td></tr>
+    <tr><td><code>equilibrium</code></td><td>达到平衡</td><td>体积变化率<code>|dV/V| &lt; 阈值</code>（用于平衡态求解）</td></tr>
+  </tbody>
+</table>
+
+<p>
+停止准则的检查集成在<code>run_until</code>的每个年度步中。一旦触发，模型返回一个状态码，供调用代码确定是继续其他步骤还是终止模拟。
+</p>
+
+<!-- ================================================================== -->
+<h2>10.7 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>默认值</th><th>作用</th><th>文件位置</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>glen_a</code></td><td>2.4e-24</td><td>Glen流动律参数</td><td>第653行</td></tr>
+    <tr><td><code>fs</code></td><td>0.0</td><td>基底滑动因子</td><td>构造函数参数</td></tr>
+    <tr><td><code>n</code></td><td>3</td><td>Glen流动律指数</td><td>硬编码</td></tr>
+    <tr><td><code>cfl</code></td><td>0.02 (Flux) / 0.5 (SemiImp)</td><td>CFL数</td><td>模型类默认</td></tr>
+    <tr><td><code>mb_elev_feedback</code></td><td>'annual'</td><td>MB高程反馈频率</td><td>构造函数参数</td></tr>
+    <tr><td><code>cfl_min_dt</code></td><td>60秒</td><td>最小子步时长</td><td>第1832行</td></tr>
+    <tr><td><code>surface_velocity_factor</code></td><td>1.0</td><td>表面速度经验乘数</td><td>cfg.PARAMS</td></tr>
+    <tr><td><code>evolution_model</code></td><td>'SemiImplicit'</td><td>配置文件默认动力学模型</td><td>cfg.PARAMS</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>10.8 总结</h2>
+
+<p>
+<code>flowline.py</code> 是OGGM动力学核心的完整实现：从冰床横截面（bed cross-section）几何的四种形状参数化，到基于SIA的两种数值方案（显式FluxBasedModel和半隐式SemiImplicitModel），再到经验的MassRedistributionCurveModel。支流系统（tributary system）通过高斯核将多条流线合并为统一的冰流通量场。自适应时间步进和MB缓存策略在物理精度与计算效率之间取得了工程平衡。
+</p>
+
+<p>
+FluxBasedModel凭借显式、直观的通量计算流程和支持多流线的能力，在许多OGGM应用中仍十分重要；SemiImplicitModel则在默认配置中承担一维动力学正演的角色。二者共同构成第9章冰厚反演与后续工作流执行之间的动力学连接环节。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch09.html">第9章：冰厚反演</a></span>
+  <span class="next"><a href="ch11.html">第11章：数值方法详解</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第15章 OGGM工作流管线 — OGGM 源码深度解析</title>
+<style>
+  :root {
+    --bg: #fafaf9;
+    --card: #ffffff;
+    --text: #1c1917;
+    --muted: #57534e;
+    --border: #e7e5e4;
+    --accent: #2563eb;
+    --accent-dim: #dbeafe;
+    --warn-bg: #fef3c7;
+    --warn-fg: #92400e;
+    --tip-bg: #d1fae5;
+    --tip-fg: #065f46;
+    --expert-bg: #ede9fe;
+    --expert-fg: #5b21b6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Noto Sans SC", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; }
+  .container { max-width: 860px; margin: 0 auto; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 3rem 3.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+  h1 { font-size: 2.2rem; border-bottom: 3px solid var(--accent); padding-bottom: .5rem; margin-bottom: .4rem; }
+  h2 { font-size: 1.55rem; margin: 2.2rem 0 .6rem; padding: .3rem 0; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.22rem; margin: 1.5rem 0 .5rem; color: var(--muted); }
+  h4 { font-size: 1.05rem; margin: 1.2rem 0 .4rem; }
+  p { margin: .7rem 0; }
+  pre { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 1rem 1.2rem; overflow-x: auto; font-size: .88rem; line-height: 1.5; margin: 1rem 0; }
+  code { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: .88rem; }
+  :not(pre) > code { background: #f0efed; color: #b91c1c; padding: .12em .4em; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  thead { background: var(--accent-dim); }
+  th, td { border: 1px solid var(--border); padding: .5rem .7rem; text-align: left; }
+  th { font-weight: 600; }
+  .callout { border-left: 4px solid; border-radius: 6px; padding: .8rem 1rem; margin: 1.2rem 0; }
+  .callout.warning { background: var(--warn-bg); border-color: #f59e0b; color: var(--warn-fg); }
+  .callout.tip { background: var(--tip-bg); border-color: #10b981; color: var(--tip-fg); }
+  .callout.expert { background: var(--expert-bg); border-color: #8b5cf6; color: var(--expert-fg); }
+  .callout-title { font-weight: 700; display: block; margin-bottom: .25rem; }
+  .tag { display: inline-block; font-size: .78rem; font-weight: 600; padding: .15em .6em; border-radius: 99px; margin-right: .3em; }
+  .tag-beginner { background: #d1fae5; color: #065f46; }
+  .tag-intermediate { background: #fef3c7; color: #92400e; }
+  .tag-advanced { background: #ede9fe; color: #5b21b6; }
+  .chapter-nav { display: flex; justify-content: space-between; margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: .9rem; }
+  footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>第15章 OGGM工作流管线</h1>
+<p><span class="tag tag-advanced">高级</span> <span class="tag tag-intermediate">核心架构</span></p>
+<p>本章深入解析OGGM的工作流编排层，涵盖<code>workflow.py</code>（约1336行）、<code>tasks.py</code>和<code>global_tasks.py</code>三个核心模块。工作流管线是OGGM的"调度层"——它定义了冰川模拟从原始数据到最终输出的完整执行路径，并提供了灵活的并行计算基础设施。</p>
+
+<div class="callout tip">
+  <span class="callout-title">从研究问题选择工作流</span>
+  <table>
+    <thead><tr><th>研究目标</th><th>最低任务链</th><th>主要输出</th><th>优先读</th></tr></thead>
+    <tbody>
+      <tr><td>估算冰储量</td><td>GIS预处理 → 气候处理 → 物质平衡校准 → 反演</td><td><code>inversion_output.pkl</code></td><td>第5-9章</td></tr>
+      <tr><td>历史面积/体积变化</td><td>反演 → 初始化流线 → <code>run_from_climate_data</code></td><td><code>model_diagnostics.nc</code></td><td>第10、15、18章</td></tr>
+      <tr><td>未来情景</td><td>历史工作流 → GCM气候处理 → 正演模拟</td><td>带filesuffix的诊断文件</td><td>第7、8、16章</td></tr>
+      <tr><td>入海型冰川</td><td>崩解反演 → 含崩解的正演 → 诊断检查</td><td><code>calving_m3</code>, <code>calving_rate</code></td><td>第12、13章</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2>15.1 架构概览：编排层设计哲学</h2>
+
+<p>OGGM的工作流系统遵循"任务即函数"的哲学。每个科学计算步骤被封装为一个独立的Python函数（称为entity task），工作流管线负责将这些函数按序编排并分发到多个冰川实体上。这种设计的核心优势在于：</p>
+
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>解耦科学逻辑与调度逻辑</strong>：科学家只需编写单冰川的处理函数，无需操心并行细节。</li>
+  <li><strong>统一的并行抽象</strong>：同一代码路径支持MPI多节点、multiprocessing多核、以及纯顺序三种执行模式。</li>
+  <li><strong>断点续传</strong>：通过任务重复检测（global task rejection）避免重复计算。</li>
+</ul>
+
+<p><code>workflow.py</code>是这套体系的核心文件。它不直接执行冰川物理计算，而是作为总指挥，调用<code>tasks.py</code>中的具体科学任务。理解workflow.py的调用关系，就等于掌握了OGGM全部功能的入口地图。</p>
+
+<h2>15.2 execute_entity_task：中央并行执行引擎</h2>
+
+<h3>15.2.1 函数签名与职责</h3>
+
+<p>位于<code>workflow.py</code>第126行的<code>execute_entity_task</code>是整个OGGM中调用频率最高的函数。几乎所有的并行工作流都经过它。其核心职责是：<strong>接收一个task函数和一组冰川目录对象（GlacierDirectory, gdir），将task应用到每个gdir上，并以并行方式收集结果</strong>。</p>
+
+<pre>def execute_entity_task(task, gdirs, **kwargs):
+    """Central parallel execution engine.
+
+    Parameters
+    ----------
+    task : callable
+        The task function to apply. Must accept a gdir as first argument.
+    gdirs : list of GlacierDirectory
+        Glacier directories to process.
+    **kwargs
+        Additional keyword arguments passed to each task invocation.
+
+    Returns
+    -------
+    list
+        Results collected from all invocations, in the same order as gdirs.
+    """</pre>
+
+<h3>15.2.2 任务规范化</h3>
+
+<p><code>task</code>参数有两种传入方式：</p>
+
+<table>
+  <thead><tr><th>传入方式</th><th>示例</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>单个可调用对象</td><td><code>tasks.compute_centerlines</code></td><td>最常见的方式，所有gdir共享同一task和kwargs</td></tr>
+    <tr><td>列表</td><td><code>[(task1, kw1), (task2, kw2), ...]</code></td><td>每个gdir可拥有不同的task和/或不同的kwargs</td></tr>
+  </tbody>
+</table>
+
+<p>在函数内部，task首先被规范化为统一的列表格式。单个函数被自动复制为与gdirs等长的列表：</p>
+
+<pre>if isinstance(task, (list, tuple)):
+    # 用户提供了每gdir的(task, kwargs)列表
+    task_list = task
+else:
+    # 统一task，复制N份
+    task_list = [(task, kwargs) for _ in gdirs]</pre>
+
+<h3>15.2.3 全局任务（global task）拒绝机制</h3>
+
+<p>这是OGGM增量计算的关键机制。在将任务分发到worker之前，系统检查每个任务是否已在目标gdir上完成。已完成的任务被替换为<code>_dummy_task</code>（一个返回<code>None</code>的空操作），从而避免浪费计算资源。</p>
+
+<p>判断依据是<code>global_tasks.py</code>中定义的任务完成标志文件。每个冰川目录（GlacierDirectory）维护一组标志文件，记录哪些处理步骤已经完成。这种设计与make的增量构建理念一致——只处理需要更新的部分。</p>
+
+<h3>15.2.4 _pickle_copier：替代functools.partial</h3>
+
+<p>Python标准库的<code>functools.partial</code>在multiprocessing环境下有一个致命缺陷：其<code>__reduce__</code>方法不完整，导致pickle序列化失败。OGGM为此设计了一个精巧的替代品：</p>
+
+<pre>class _pickle_copier(object):
+    """A pickleable alternative to functools.partial.
+
+    Multiprocessing needs to pickle the task and its arguments.
+    functools.partial objects are not reliably pickleable across
+    all Python versions, so we use this custom class instead.
+    """
+    def __init__(self, func, *args, **kwargs):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+
+    def __call__(self, gdir):
+        return self.func(gdir, *self.args, **self.kwargs)</pre>
+
+<p>这个类的对象可以被pickle（因为<code>func</code>、<code>args</code>、<code>kwargs</code>都是简单属性），从而安全地跨进程边界传递。</p>
+
+<div class="callout tip">
+  <span class="callout-title">设计笔记</span>
+  如果你在自己的项目中遇到multiprocessing的pickle问题，<code>_pickle_copier</code>模式可以直接复用。但请注意：被包装的函数必须是模块级的（不能是lambda或嵌套函数），否则仍然无法pickle。
+</div>
+
+<h3>15.2.5 MPI与Multiprocessing的分派</h3>
+
+<p>经过规范化和全局任务（global task）检查后，实际执行路径根据可用并行后端选择：</p>
+
+<pre>if _have_ogmpi:
+    # MPI模式：master分发，worker执行
+    out = ogmpi.mpi_master_spin_tasks(gdirs, task_list)
+elif len(gdirs) > 1:
+    # 多进程模式：创建进程池
+    pool = init_mp_pool()
+    out = pool.map(run_task_on_gdir, zip(gdirs, task_list))
+else:
+    # 顺序模式：单核回退
+    log.warning("OGGM is running sequentially!")
+    out = [run_task_on_gdir((g, t)) for g, t in zip(gdirs, task_list)]</pre>
+
+<p>顺序回退时会输出一条警告，帮助用户在排查性能问题时快速定位配置错误。</p>
+
+<h2>15.3 execute_parallel_tasks：单冰川并行</h2>
+
+<p><code>workflow.py</code>第197行的<code>execute_parallel_tasks</code>解决了一个不同于<code>execute_entity_task</code>的问题：对<strong>同一个</strong>冰川目录（GlacierDirectory）执行多个可以并行运行的任务。这在高分辨率冰川处理或复杂的后处理流程中非常有用。</p>
+
+<p>其实现相对简单：利用<code>multiprocessing.pool.ThreadPool</code>（线程池，而非进程池），因为任务之间共享同一个gdir的内存视图，使用线程可以避免数据复制的开销。</p>
+
+<h2>15.4 Multiprocessing基础设施</h2>
+
+<h3>15.4.1 init_mp_pool：进程池生命周期管理</h3>
+
+<p><code>init_mp_pool</code>（第41行）负责创建、复用、重置和销毁multiprocessing进程池。它维护了一个模块级变量<code>_mp_pool</code>和一个标志<code>CONFIG_MODIFIED</code>：</p>
+
+<pre>def init_mp_pool(reset=False):
+    """Get or create the global multiprocessing pool.
+
+    If OGGM configuration has changed since the pool was created,
+    the old pool is automatically terminated and a fresh one is
+    created with the new settings.
+    """
+    global _mp_pool, CONFIG_MODIFIED
+    if reset or CONFIG_MODIFIED:
+        if _mp_pool is not None:
+            _mp_pool.terminate()
+            _mp_pool = None
+        CONFIG_MODIFIED = False
+
+    if _mp_pool is None:
+        _mp_pool = Pool(processes=cfg.PARAMS['mp_processes'],
+                        initializer=_init_pool_globals)
+    return _mp_pool</pre>
+
+<p><code>CONFIG_MODIFIED</code>标志是一个巧妙的设计：只要<code>cfg.PARAMS</code>被修改，该标志就被置为<code>True</code>，下一次调用<code>init_mp_pool</code>时自动重建进程池。这避免了配置变更后pool中的worker仍使用旧配置的问题。</p>
+
+<h3>15.4.2 _init_pool_globals：Worker初始化</h3>
+
+<p>每个multiprocessing worker进程在启动时调用<code>_init_pool_globals</code>，将OGGM配置解包到进程的全局命名空间。这确保了所有worker共享一致的参数设置。</p>
+
+<h3>15.4.3 use_mp_spawn与跨平台兼容</h3>
+
+<p>在Windows上，Python的multiprocessing默认使用<code>spawn</code>（而非Linux的<code>fork</code>）创建子进程。spawn模式下，子进程不继承父进程的内存，因此需要重新导入模块。OGGM通过<code>use_mp_spawn</code>配置项处理这一差异，并在必要时回退到顺序执行。</p>
+
+<div class="callout warning">
+  <span class="callout-title">关键限制</span>
+  在Jupyter Notebook中使用multiprocessing时，spawn模式可能导致无限递归导入。OGGM建议在notebook环境中始终设置<code>mp_processes=1</code>（即关闭多进程），或使用--mpi后端。
+</div>
+
+<h2>15.5 init_glacier_directories：工作流的起点</h2>
+
+<h3>15.5.1 从RGI GeoDataFrame初始化</h3>
+
+<p><code>init_glacier_directories</code>（第325行）是任何OGGM运行的第一步。它接受一个pandas GeoDataFrame（通常来自RGI shapefile），为每一行创建对应的<code>GlacierDirectory</code>（gdir）对象：</p>
+
+<pre>gdirs = workflow.init_glacier_directories(rgi_df)</pre>
+
+<p>该函数调用<code>_check_rgi_input</code>进行输入验证，包括：</p>
+<ul style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>重复冰川检测</strong>：检查RGI ID是否有重复，防止同一冰川被初始化两次。</li>
+  <li><strong>连通级别检查</strong>：要求连接级别2（Connectivity Level 2），即冰川的拓扑连接关系已知，这是下游流线计算的前提条件。</li>
+</ul>
+
+<h3>15.5.2 RGI版本自动检测</h3>
+
+<p>OGGM能自动区分RGI v6和v7格式。通过检查DataFrame的列名和元数据，系统选择合适的读取器。v7版本引入了更多的属性列和不同的坐标系参数。</p>
+
+<h3>15.5.3 Intersects数据库自动配置</h3>
+
+<p>RGI intersects文件记录了每条冰川与气候网格和历史数据产品的空间交集。如果该文件在默认位置存在，<code>init_glacier_directories</code>会自动加载；否则输出警告并跳过需要交集信息的后续步骤。</p>
+
+<h3>15.5.4 恢复模式与预计算存档</h3>
+
+<table>
+  <thead><tr><th>初始化方式</th><th>函数/参数</th><th>适用场景</th></tr></thead>
+  <tbody>
+    <tr><td>从RGI新运行</td><td><code>init_glacier_directories(rgi_df)</code></td><td>首次处理</td></tr>
+    <tr><td>续跑</td><td><code>init_glacier_directories(rgi_df, from_prepro_level=N)</code></td><td>从预处理级别（prepro level）N恢复</td></tr>
+    <tr><td>从tar恢复</td><td><code>init_glacier_directories(rgi_df, from_tar='url')</code></td><td>从远程存档恢复</td></tr>
+  </tbody>
+</table>
+
+<p>续跑模式下，OGGM加载已有gdir的状态并跳过已完成的步骤，仅执行未完成的任务。从tar恢复则是从预处理的压缩包中解压完整的gdir目录。</p>
+
+<h2>15.6 工作流快捷函数</h2>
+
+<p><code>workflow.py</code>提供了一系列快捷函数，每个函数封装了一条完整的子管线。这些函数是用户最常直接调用的API。</p>
+
+<h3>15.6.1 gis_prepro_tasks：流线预处理链</h3>
+
+<p>位于第487行，这是OGGM最长的子管线，共10个任务：</p>
+
+<pre>def gis_prepro_tasks(gdirs, **kwargs):
+    task_list = [
+        tasks.define_glacier_region,        # 1. 定义冰川区域
+        tasks.glacier_masks,                # 2. 冰川掩膜
+        tasks.compute_centerlines,          # 3. 计算中心线
+        tasks.initialize_flowlines,         # 4. 初始化流线
+        tasks.compute_downstream_line,      # 5. 计算下游延长线
+        tasks.compute_downstream_bedshape,  # 6. 下游冰床形态
+        tasks.catchment_area,               # 7. 集水区面积
+        tasks.catchment_intersections,      # 8. 集水区交叉
+        tasks.catchment_width_geom,         # 9. 几何宽度计算
+        tasks.catchment_width_correction,   # 10. 宽度修正
+    ]
+    for task, kwargs in task_list:
+        execute_entity_task(task, gdirs, **kwargs)</pre>
+
+<p>这条管线从原始DEM出发，逐步构建出冰川流线网络和集水区几何。每个步骤的输出是下一步的输入，形成严密的数据依赖链。初学者通常应使用<code>gis_prepro_tasks</code>保持标准顺序；只有在调试或开发新方法时，才建议逐步拆开运行。</p>
+
+<h3>15.6.2 climate_tasks：气候与物质平衡校准链</h3>
+
+<p>位于第513行，包含3个核心任务：</p>
+<pre>
+process_climate_data → local_mustar → apparent_mb_from_any_mb
+</pre>
+<p><code>local_mustar</code>（即<code>mb_calibration_from_geodetic_mb</code>）是校准的核心——它利用大地测量数据调整温度敏感度参数mu*，使模型物质平衡与观测一致。</p>
+
+<h3>15.6.3 inversion_tasks：冰厚反演链</h3>
+
+<p>位于第531行。这是OGGM最复杂的子管线，因为需要区分是否有冰川崩解（calving）：</p>
+
+<pre>if gdir.is_tidewater:
+    # 崩解冰川路径
+    tasks.prepare_for_inversion(gdir, ...)
+    tasks.mass_conservation_inversion(gdir, ...)
+    tasks.filter_inversion_output(gdir, ...)
+else:
+    # 陆地冰川路径
+    tasks.prepare_for_inversion(gdir, ...)
+    tasks.mass_conservation_inversion(gdir, ...)
+    tasks.filter_inversion_output(gdir, ...)</pre>
+
+<p>两条路径共享相同的函数名，但内部算法因冰川类型不同而有所差异。<code>mass_conservation_inversion</code>实现了基于冰厚-冰流通量关系的物质守恒反演方法。</p>
+
+<h3>15.6.4 calibrate_inversion_from_consensus</h3>
+
+<p>位于第586行，是OGGM最关键的全局校准步骤。它通过优化Glen流动律参数A，使OGGM反演的全球冰川冰体积与Farinotti等人（2019）的共识估计相匹配：</p>
+
+<pre>def calibrate_inversion_from_consensus(gdirs, ...):
+    # 搜索Glen A，使总体积收敛到全球共识值
+    for A in glen_a_values:
+        execute_entity_task(tasks.mass_conservation_inversion, gdirs, glen_a=A)
+        total_volume = sum(gdir.read_pickle('inversion_output')['volume'] for gdir in gdirs)
+        if abs(total_volume - consensus_volume) < tolerance:
+            break</pre>
+
+<p><code>calibrate_inversion_from_volume</code>（第783行）是该函数的单冰川变体，<code>invert_from_params</code>（第725行）则使用预计算的参数跳过迭代搜索过程。</p>
+
+<h2>15.7 merge_glacier_tasks：支流合并工作流</h2>
+
+<p>位于第901行，处理支冰川与主冰川的合并。在自然冰川系统中，多条冰流汇入同一冰川，OGGM需要将这些支流整合到单一流线网络中：</p>
+
+<pre>def merge_glacier_tasks(gdirs, **kwargs):
+    # 步骤1：检测支流关系
+    execute_entity_task(tasks.intersect_downstream_lines, gdirs)
+    # 步骤2：递归合并
+    gdirs = _recursive_merging(gdirs)
+    # 步骤3：清理合并后的流线
+    execute_entity_task(tasks.clean_merged_flowlines, gdirs)
+    return gdirs</pre>
+
+<p><code>_recursive_merging</code>是核心算法：它识别RGI连接级别2中定义的支流关系，从末端支流开始，逐步向上游合并，最终每条冰川只有一个主gdir。合并过程中需要重新计算流线拓扑、宽度分布和集水区边界。</p>
+
+<div class="callout expert">
+  <span class="callout-title">专家提示</span>
+  支流合并是整个工作流中最容易出现问题的环节之一。常见的错误包括：流线相交拓扑不一致、合并后宽度突变导致的反演不稳定、以及支流编号丢失。调试时建议先用<code>plot_domain</code>可视化检查合并前后的流线网络。
+</div>
+
+<h2>15.8 merge_gridded_data：2D格网数据（gridded data）合并</h2>
+
+<p>位于第1025行，处理GriddedNcdfFile格式的2D输出数据组合。当多条冰川的输出格网需要合并为区域数据集时使用：</p>
+
+<pre>def merge_gridded_data(gdirs, variables=None, combine_plots=None, ...):
+    # 创建统一的输出格网
+    target_grid = create_target_grid(gdirs)
+    # 逐个变量重投影和合并
+    for var in variables:
+        merged = reproject_and_merge(gdirs, var, target_grid)
+        # 高斯平滑减少边缘伪影
+        merged_smooth = gaussian_filter(merged, sigma=1.0)
+    return merged_dataset</pre>
+
+<p>格网合并面临三个主要挑战：不同冰川可能使用不同分辨率和投影、合并边界处可能出现不连续、以及总面积和总体积等全局量需要在重投影中保持守恒。OGGM通过保守重投影和高斯平滑来应对。</p>
+
+<h2>15.9 预处理级别（prepro level）系统</h2>
+
+<p>预处理级别（prepro level）系统（定义于<code>cli/prepro_levels.py</code>）是OGGM工业化运行的核心。它将完整工作流分为5个渐进级别：</p>
+
+<table>
+  <thead><tr><th>级别</th><th>名称</th><th>包含步骤</th><th>输出</th></tr></thead>
+  <tbody>
+    <tr><td>L0</td><td>初始化</td><td>init_glacier_directories</td><td>gdir骨架</td></tr>
+    <tr><td>L1</td><td>DEM处理</td><td>define_glacier_region + glacier_masks</td><td>冰川掩膜</td></tr>
+    <tr><td>L2</td><td>流线</td><td>compute_centerlines → catchment_width_correction</td><td>完整流线网络</td></tr>
+    <tr><td>L3</td><td>气候+反演</td><td>climate_tasks + inversion_tasks + 校准</td><td>冰厚+mu*</td></tr>
+    <tr><td>L4</td><td>历史模拟</td><td>historical_run</td><td>时间序列输出</td></tr>
+    <tr><td>L5</td><td>清理</td><td>删除中间文件</td><td>精简gdir</td></tr>
+  </tbody>
+</table>
+
+<p>每个级别完成后，系统将结果打包为tar存档。下一级别可以通过<code>--start-base-url</code>加载前一级别的存档，实现增量恢复。这种设计带来了两大好处：</p>
+<ol style="margin: .8rem 0; padding-left: 1.5rem;">
+  <li><strong>故障隔离</strong>：如果L3失败，不需要重新运行L0-L2。只需从L2存档恢复。</li>
+  <li><strong>分布式处理</strong>：不同RGI区域可以在不同节点上独立运行各个级别，存档是节点间传递数据的标准格式。</li>
+</ol>
+
+<h2>15.10 小结</h2>
+
+<p><code>workflow.py</code>是OGGM的工作流编排层。它以不到1400行Python代码连接单冰川任务、全局任务（global task）、错误处理和并行执行。其核心设计是将科学任务与调度基础设施解耦，通过任务状态记录支持增量计算，并提供从单行Python脚本到集群批处理的统一API。理解<code>workflow.py</code>的调用模式后，自定义处理管线通常只需要编写遵循<code>(gdir, **kwargs)</code>签名的函数，再交给<code>execute_entity_task</code>调度。</p>
+
+<div class="chapter-nav">
+  <span>上一章：第14章</span>
+  <span>下一章：第16章 命令行界面</span>
+</div>
+<footer>OGGM 源码深度解析 &copy; 2026</footer>
+
+</div>
+</body>
+</html>

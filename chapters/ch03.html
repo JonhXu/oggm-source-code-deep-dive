@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第3章 配置系统深度解析 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第3章 配置系统深度解析（cfg.py）</h1>
+
+<p>
+OGGM的配置系统是理解整个框架运行机制的"入口"。所有模块的行为——从DEM网格分辨率到冰流变参数再到输出文件格式——都由一个统一的配置层控制。本章剖析 <code>oggm/cfg.py</code> 的源码实现，涵盖全局状态单例、初始化链、参数类型系统、多进程安全机制，以及环境变量覆盖系统。
+</p>
+
+<div class="callout tip">
+  <div class="callout-title">初学者先读这里</div>
+  <p>第一次使用OGGM时，你只需要记住三个对象：<code>cfg.initialize()</code>启动配置，<code>cfg.PATHS['working_dir']</code>决定数据写到哪里，<code>cfg.PARAMS</code>保存模型参数。3.4节之后的ConfigObj、多进程序列化和环境变量机制主要面向需要部署或开发OGGM的读者，第一遍可以跳过。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>3.1 全局状态设计</h2>
+
+<p>
+OGGM使用模块级单例（module-level singletons）管理全局状态，定义了五个核心全局变量：
+</p>
+
+<pre><code><span class="cmt"># cfg.py 中的全局变量定义（模块顶层）</span>
+<span class="kw">PARAMS</span>       = <span class="dec">ParamsLoggingDict</span>()    <span class="cmt"># 所有数值和字符串参数</span>
+<span class="kw">PATHS</span>        = <span class="dec">PathOrderedDict</span>()      <span class="cmt"># 路径配置，自动展开 ~</span>
+<span class="kw">BASENAMES</span>    = <span class="dec">DocumentedDict</span>()       <span class="cmt"># 逻辑→物理文件名映射</span>
+<span class="kw">DATA</span>         = <span class="kw">{}</span>                     <span class="cmt"># 跨进程共享数据（只读）</span>
+<span class="kw">LRUHANDLERS</span>  = <span class="kw">{}</span>                     <span class="cmt"># LRU缓存文件句柄池</span>
+<span class="kw">CONFIG_MODIFIED</span> = <span class="kw">False</span>                 <span class="cmt"># 配置是否被修改（多进程安全标志）</span></code></pre>
+
+<div class="callout">
+  <div class="callout-title">设计理由：为何使用模块级全局变量？</div>
+  <p>
+    在典型的面向对象设计中，你可能会将配置封装在类实例中并通过依赖注入传递。OGGM选择模块级全局变量的原因有三：(1) 科学模型有大量参数（300+），通过每层函数签名传递将极为繁琐；(2) 参数调整是建模工作流的核心操作，全局访问路径（<code>cfg.PARAMS['melt_f']</code>）降低了使用门槛；(3) 方便实现环境变量覆盖（无需修改调用链）。代价是牺牲了线程安全——但OGGM选择进程级并行（multiprocessing）来规避这个问题（见3.5节）。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>3.2 params.cfg：主参数文件</h2>
+
+<p>
+<code>params.cfg</code> 是OGGM的主参数文件，约600行，使用简单的key-value格式（由ConfigObj库解析）。它打包在 <code>oggm/</code> 包目录中随版本发布。OGGM v1.6.3中的片段示例如下：
+</p>
+
+<pre><code><span class="cmt">### params.cfg (节选) ###</span>
+grid_dx_method = square
+map_proj = 'tmerc'
+border = 80
+use_multiple_flowlines = True
+flowline_dx = 2
+baseline_climate = GSWP3_W5E5
+temp_default_gradient = -0.0065
+temp_melt = -1.
+melt_f = 5
+prcp_fac =
+glen_a = 2.4e-24
+glen_n = 3
+fs = 0
+cfl_number = 0.02
+evolution_model = SemiImplicit</code></pre>
+
+<p>
+文件按注释块组织为路径、网格、中心线、气候、反演、动力学和输出等主题。解析后，参数被写入<code>cfg.PARAMS</code>；路径类配置则写入<code>cfg.PATHS</code>。因此，日常建模时通常不直接编辑OGGM包内的<code>params.cfg</code>，而是在脚本中显式覆盖需要改变的少数参数。
+</p>
+
+<span class="tag tag-beginner">入门</span>
+<div class="callout tip">
+  <div class="callout-title">如何查找你的参数</div>
+  <p>
+    当你需要改变模型的某个行为（例如调整融化因子或DEM分辨率）时，最有效的方法是在 <code>params.cfg</code> 中搜索相关关键词，并对照附录B确认默认值和使用模块。初学者建议只改工作目录、并行开关、预处理边界、气候数据源和少数校准参数；Glen参数、崩解参数和数值时间步长应在做敏感性实验时再修改。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>3.3 初始化链：initialize_minimal() 到 initialize()</h2>
+
+<p>
+OGGM的初始化分为两级。理解这一链式调用是理解整个系统启动过程的关键。
+</p>
+
+<h3>3.3.1 initialize_minimal()</h3>
+<p>
+<code>initialize_minimal()</code> 执行最低限度的设置，约20行代码：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">initialize_minimal</span>(<span class="dec">config_file</span>=<span class="kw">None</span>, <span class="dec">logging_level</span>=<span class="str">'INFO'</span>,
+                         <span class="dec">add_custom_path</span>=<span class="kw">None</span>):
+    <span class="cmt"># 1. 读取打包的 params.cfg → PARAMS</span>
+    _read_cfg_file(config_file)
+
+    <span class="cmt"># 2. 设置 PATHS — 展开 ~ 并设置默认路径</span>
+    _set_up_paths(add_custom_path)
+
+    <span class="cmt"># 3. 应用环境变量覆盖（OGGM_WORKDIR, ...）</span>
+    _apply_env_vars()
+
+    <span class="cmt"># 4. 重新配置日志系统</span>
+    _set_up_logging(logging_level)</code></pre>
+
+<p>
+调用顺序：首先是读取 <code>params.cfg</code> 并填充 <code>PARAMS</code> 字典；然后设置 <code>PATHS</code>（工作目录、缓存目录等）；然后扫描环境变量并覆盖 <code>PARAMS</code> 和 <code>PATHS</code> 中的对应项；最后重新配置日志记录器。
+</p>
+
+<h3>3.3.2 initialize()</h3>
+<p>
+<code>initialize()</code> 在 <code>initialize_minimal()</code> 的基础上执行额外的"重量级"初始化：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">initialize</span>(<span class="dec">config_file</span>=<span class="kw">None</span>, <span class="dec">logging_level</span>=<span class="str">'INFO'</span>,
+                 <span class="dec">add_custom_path</span>=<span class="kw">None</span>):
+    <span class="cmt"># 1. 调用 initialize_minimal()</span>
+    initialize_minimal(config_file, logging_level, add_custom_path)
+
+    <span class="cmt"># 2. 下载打包的ship-file: params.cfg 中没有内嵌的数据文件</span>
+    <span class="cmt">#    （如默认DEM、海岸线shapefile等）</span>
+    _download_support_files()
+
+    <span class="cmt"># 3. 初始化LRU文件缓存（用于DEM瓦片）</span>
+    _init_lru_handlers()
+
+    <span class="cmt"># 4. 预计算一些派生常量</span>
+    _init_derived_constants()</code></pre>
+
+<p>
+<strong>何时使用哪个？</strong> 在不需要DEM数据或气候数据时（例如仅检查参数、处理已有预处理数据），使用 <code>initialize_minimal()</code> 即可，它启动更快（约0.5秒）。在需要完整建模功能的场景中，使用 <code>initialize()</code>（约3-5秒，取决于是否需要下载支持文件）。
+</p>
+
+<!-- ================================================================== -->
+<h2>3.4 ConfigObj作为INI解析主干</h2>
+
+<p>
+OGGM选择 <a href="https://github.com/DiffSK/configobj">ConfigObj</a>（一个纯Python的INI文件解析库）作为参数文件的解析器，而非标准库的 <code>configparser</code>。原因包括：
+</p>
+
+<ul>
+  <li>ConfigObj 保留了INI条目的原始顺序（OrderedDict-like），这在参数文档化时很有用</li>
+  <li>支持嵌套subsection（如 <code>[massbalance.temp_bias]</code>）</li>
+  <li>内联注释保留（以 <code>;</code> 开头），可用于自动生成参数文档</li>
+  <li>支持列表值语法（如 <code>filesuffix = string(default='')</code> 与 <code>list(default=list('_ba1', '_ba2'))</code>）</li>
+</ul>
+
+<p>
+解析过程在 <code>_read_cfg_file()</code> 内部函数中完成（cfg.py 约第200行）：
+</p>
+
+<pre><code><span class="kw">from</span> configobj <span class="kw">import</span> ConfigObj
+<span class="kw">from</span> oggm.cfg <span class="kw">import</span> _typed_configobj_parser
+
+<span class="kw">def</span> <span class="fn">_read_cfg_file</span>(<span class="dec">config_file</span>):
+    <span class="cmt"># 使用 ConfigObj 解析原始 INI</span>
+    _cfg = ConfigObj(config_file, <span class="dec">file_error</span>=<span class="kw">True</span>,
+                     <span class="dec">interpolation</span>=<span class="kw">False</span>)
+
+    <span class="cmt"># _typed_configobj_parser 执行类型转换：</span>
+    <span class="cmt"># 'float(default=5.0)' → PARAMS['key'] = 5.0 (float)</span>
+    <span class="cmt"># 'int(default=80)'    → PARAMS['key'] = 80 (int)</span>
+    <span class="cmt"># 'bool(default=True)' → PARAMS['key'] = True (bool)</span>
+    _typed_configobj_parser(_cfg)</code></pre>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">ConfigObj的序列化陷阱</div>
+  <p>
+    当使用 <code>pack_config()</code> 进行配置序列化时（多进程通信场景），ConfigObj对象被通过 <code>configobj.ConfigObj.write()</code> 方法序列化为字符串。由于ConfigObj使用 <code>repr()</code> 写入列表值，而Python的 <code>repr()</code> 对于包含Unicode的字符串可能产生与原始值不同的表示。如果遇到配置在多进程间传递后参数变化的问题，检查参数值中是否包含非ASCII字符。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>3.5 环境变量覆盖系统</h2>
+
+<p>
+OGGM允许通过环境变量覆盖几乎任何参数，格式为 <code>OGGM_ + 大写参数名</code>。这在无需修改代码或配置文件的容器化部署场景中尤其有用。
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>环境变量</th>
+      <th>覆盖的配置</th>
+      <th>示例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>OGGM_WORKDIR</code></td>
+      <td><code>PATHS['working_dir']</code></td>
+      <td><code>OGGM_WORKDIR=/data/oggm_work</code></td>
+    </tr>
+    <tr>
+      <td><code>OGGM_USE_MULTIPROCESSING</code></td>
+      <td><code>PARAMS['use_multiprocessing']</code></td>
+      <td><code>OGGM_USE_MULTIPROCESSING=True</code></td>
+    </tr>
+    <tr>
+      <td><code>OGGM_MP_POOL_SIZE</code></td>
+      <td><code>PARAMS['mp_processes']</code></td>
+      <td><code>OGGM_MP_POOL_SIZE=16</code></td>
+    </tr>
+    <tr>
+      <td><code>OGGM_DL_CACHE_DIR</code></td>
+      <td><code>PATHS['dl_cache_dir']</code></td>
+      <td>覆盖默认下载缓存目录</td>
+    </tr>
+    <tr>
+      <td><code>OGGM_MELT_F</code></td>
+      <td><code>PARAMS['melt_f']</code></td>
+      <td><code>OGGM_MELT_F=3.5</code></td>
+    </tr>
+    <tr>
+      <td><code>OGGM_GLEN_A</code></td>
+      <td><code>PARAMS['glen_a']</code></td>
+      <td><code>OGGM_GLEN_A=2.4e-24</code></td>
+    </tr>
+    <tr>
+      <td><code>OGGM_INVERSION_GLEN_A</code></td>
+      <td><code>PARAMS['inversion_glen_a']</code></td>
+      <td>反演时使用的Glen A（可与演化不同）</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+实现位于 <code>_apply_env_vars()</code> 函数中（cfg.py约第300行）：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">_apply_env_vars</span>():
+    <span class="cmt"># 扫描所有以 'OGGM_' 开头的环境变量</span>
+    <span class="kw">for</span> k, v <span class="kw">in</span> os.environ.items():
+        <span class="kw">if</span> <span class="kw">not</span> k.startswith(<span class="str">'OGGM_'</span>):
+            <span class="kw">continue</span>
+        param_name = k[5:].lower()  <span class="cmt"># 去除 'OGGM_' 前缀并转小写</span>
+
+        <span class="cmt"># 优先匹配 PATHS 中的键</span>
+        <span class="kw">if</span> param_name <span class="kw">in</span> PATHS:
+            PATHS[param_name] = os.path.expanduser(v)
+            <span class="kw">continue</span>
+
+        <span class="cmt"># 然后尝试匹配 PARAMS 中的键并自动转换类型</span>
+        <span class="kw">if</span> param_name <span class="kw">in</span> PARAMS:
+            PARAMS[param_name] = _type_convert(v, <span class="kw">type</span>(PARAMS[param_name]))</code></pre>
+
+<!-- ================================================================== -->
+<h2>3.6 类型强制转换</h2>
+
+<p>
+<code>_type_convert()</code> 是配置系统中的一个关键工具函数，它负责将INI文件和环境变量中的字符串值转换为正确的Python类型：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">_type_convert</span>(<span class="dec">value</span>, <span class="dec">target_type</span>):
+    <span class="cmt"># bool:  "True"/"False" → Python bool</span>
+    <span class="cmt"># int:   "80" → Python int</span>
+    <span class="cmt"># float: "5.0" → Python float</span>
+    <span class="cmt"># list:  "['a', 'b']" → Python list (通过 ast.literal_eval)</span>
+    <span class="cmt"># str:   透传</span>
+    ...</code></pre>
+
+<p>
+对于列表类型，使用 <code>ast.literal_eval</code> 安全解析（可处理嵌套列表和元组）。其他类型则依赖于Python内置的类型构造函数。
+</p>
+
+<!-- ================================================================== -->
+<h2>3.7 自定义字典类型</h2>
+
+<h3>3.7.1 DocumentedDict</h3>
+<p>
+<code>DocumentedDict</code> 是OGGM为 <code>BASENAMES</code> 定制的字典子类（cfg.py中定义）。它重写了 <code>__setitem__</code> 方法，要求每个值是一个 <code>(description, filename)</code> 元组，其中 <code>description</code> 作为文档字符串存储。这确保了每个逻辑文件名都有清晰的人类可读描述。
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">DocumentedDict</span>(<span class="kw">dict</span>):
+    <span class="kw">def</span> <span class="fn">__setitem__</span>(<span class="dec">self</span>, <span class="dec">key</span>, <span class="dec">value</span>):
+        <span class="cmt"># value 应为 (docstring, default_name) 元组</span>
+        <span class="kw">if</span> <span class="kw">not</span> <span class="kw">isinstance</span>(value, <span class="kw">tuple</span>) <span class="kw">or</span> <span class="kw">len</span>(value) != <span class="num">2</span>:
+            <span class="kw">raise</span> <span class="kw">ValueError</span>(<span class="str">'DocumentedDict requires (doc, name) tuples'</span>)
+        <span class="kw">super</span>().__setitem__(key, value[<span class="num">1</span>])  <span class="cmt"># 只存储文件名</span>
+        <span class="cmt"># value[0] (文档字符串) 存储在 self.__doc__ 或其他属性中</span></code></pre>
+
+<h3>3.7.2 ParamsLoggingDict</h3>
+<p>
+<code>ParamsLoggingDict</code> 扩展了标准 <code>dict</code>，在每次参数被修改时记录日志并设置 <code>CONFIG_MODIFIED</code> 标志。这为多进程安全的配置传播提供了基础。
+</p>
+
+<pre><code><span class="kw">class</span> <span class="fn">ParamsLoggingDict</span>(<span class="kw">dict</span>):
+    <span class="kw">def</span> <span class="fn">__setitem__</span>(<span class="dec">self</span>, <span class="dec">key</span>, <span class="dec">value</span>):
+        <span class="cmt"># 记录变更日志</span>
+        log.info(<span class="str">f"PARAMS['{key}'] changed: {self.get(key)} → {value}"</span>)
+        <span class="kw">global</span> CONFIG_MODIFIED
+        CONFIG_MODIFIED = <span class="kw">True</span>
+        <span class="kw">super</span>().__setitem__(key, value)</code></pre>
+
+<span class="tag tag-beginner">入门</span>
+<div class="callout tip">
+  <div class="callout-title">查找参数修改的源头</div>
+  <p>
+    当你在一个大型OGGM脚本中调试时，如果想知道哪些参数在何处被修改，可以临时设置 <code>cfg.PARAMS._log_changes = True</code>。ParamsLoggingDict 会打印每次赋值操作的文件名和行号（通过 <code>traceback.extract_stack()</code>）。这在追踪意外的参数覆盖时非常有用。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>3.8 多进程安全：pack/unpack/set_manager</h2>
+
+<p>
+这是OGGM配置系统中最精妙的设计之一。在Python多进程环境中，每个子进程有自己独立的内存空间，模块级全局变量的修改不会在进程间自动传播。OGGM通过以下三个函数解决这个问题：
+</p>
+
+<pre><code><span class="cmt"># 主进程：将配置序列化为可传递的字典</span>
+<span class="kw">def</span> <span class="fn">pack_config</span>():
+    <span class="kw">return</span> {
+        <span class="str">'PARAMS'</span>:    <span class="kw">dict</span>(PARAMS),
+        <span class="str">'PATHS'</span>:     <span class="kw">dict</span>(PATHS),
+        <span class="str">'BASENAMES'</span>: <span class="kw">dict</span>(BASENAMES),
+        <span class="str">'DATA'</span>:      DATA,   <span class="cmt"># DATA 应为只读，直接共享引用</span>
+    }
+
+<span class="cmt"># 子进程：反序列化配置字典并还原全局状态</span>
+<span class="kw">def</span> <span class="fn">unpack_config</span>(<span class="dec">cfg_dict</span>):
+    <span class="kw">global</span> PARAMS, PATHS, BASENAMES, DATA
+    PARAMS.update(cfg_dict[<span class="str">'PARAMS'</span>])
+    PATHS.update(cfg_dict[<span class="str">'PATHS'</span>])
+    BASENAMES.update(cfg_dict[<span class="str">'BASENAMES'</span>])
+    <span class="kw">global</span> CONFIG_MODIFIED
+    CONFIG_MODIFIED = <span class="kw">False</span>  <span class="cmt"># 子进程重置修改标志</span>
+
+<span class="cmt"># 为多进程Manager设置共享状态</span>
+<span class="kw">def</span> <span class="fn">set_manager</span>(<span class="dec">manager</span>):
+    <span class="kw">global</span> _MANAGER
+    _MANAGER = manager  <span class="cmt"># 用于同步 DATA 和 LRUHANDLERS</span></code></pre>
+
+<p>
+工作流执行器（<code>execute_entity_task()</code>）会在启动进程池时自动调用 <code>pack_config()</code>，并在每个worker的初始化函数中调用 <code>unpack_config()</code>。这意味着：
+</p>
+
+<ul>
+  <li>如果在主进程中修改了 <code>PARAMS['melt_f'] = 8.0</code>，新值会自动传播到所有worker</li>
+  <li>如果在worker中修改了PARAMS，不会影响主进程或其他worker（由于 <code>CONFIG_MODIFIED</code> 在unpack时被重置）</li>
+</ul>
+
+<span class="tag tag-advanced">专家</span>
+<div class="callout expert">
+  <div class="callout-title">配置传播的边界情况</div>
+  <p>
+    注意：<code>pack_config()</code> 只在进程池创建时调用一次。如果你在进程池运行期间修改了主进程的PARAMS，已在运行的worker不会收到更新。因此，如果你需要在并行处理之前动态修改参数，建议在调用 <code>execute_entity_task()</code> 之前完成所有配置修改。如果需要动态行为，应考虑将参数作为entity_task的函数参数传递（如 <code>melt_f=None</code> 时使用全局参数），这样worker内部可以检查参数而不是依赖全局状态。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>3.9 参数组深度解析</h2>
+
+<p>
+以下表格按逻辑分组列出了OGGM中最关键的配置参数：
+</p>
+
+<h3>3.9.1 I/O和路径参数</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>类型</th>
+      <th>默认值</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>working_dir</code></td>
+      <td>str</td>
+      <td>~/.oggm_working_dir</td>
+      <td>所有冰川数据和输出的根目录</td>
+    </tr>
+    <tr>
+      <td><code>dl_cache_dir</code></td>
+      <td>str</td>
+      <td>~/.oggm_cache</td>
+      <td>DEM瓦片下载缓存</td>
+    </tr>
+    <tr>
+      <td><code>use_multiprocessing</code></td>
+      <td>bool</td>
+      <td>True</td>
+      <td>是否默认启用多进程处理</td>
+    </tr>
+    <tr>
+      <td><code>mp_processes</code></td>
+      <td>int</td>
+      <td>-1</td>
+      <td>并行进程数（-1=全部CPU核心）</td>
+    </tr>
+    <tr>
+      <td><code>mp_pool_timeout_task</code></td>
+      <td>float</td>
+      <td>3600</td>
+      <td>单任务超时（秒）</td>
+    </tr>
+    <tr>
+      <td><code>use_compression</code></td>
+      <td>bool</td>
+      <td>True</td>
+      <td>pickle文件是否使用gzip压缩</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.9.2 网格与映射参数</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>类型</th>
+      <th>默认值</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>map_proj</code></td>
+      <td>str</td>
+      <td>'tmerc'</td>
+      <td>地图投影类型（横轴墨卡托/等面积）</td>
+    </tr>
+    <tr>
+      <td><code>grid_dx_method</code></td>
+      <td>str</td>
+      <td>'linear'</td>
+      <td>网格间距计算方法（'linear'或'fixed'）</td>
+    </tr>
+    <tr>
+      <td><code>border</code></td>
+      <td>int</td>
+      <td>80</td>
+      <td>本地地图边框像素数</td>
+    </tr>
+    <tr>
+      <td><code>topo_interp</code></td>
+      <td>str</td>
+      <td>'bilinear'</td>
+      <td>地形插值方法（'bilinear', 'cubic', 'nearest'）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.9.3 中心线参数</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>类型</th>
+      <th>默认值</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>flowline_dx</code></td>
+      <td>int</td>
+      <td>0</td>
+      <td>流线网格间距（0=自动基于dem）</td>
+    </tr>
+    <tr>
+      <td><code>q1</code></td>
+      <td>float</td>
+      <td>1.2</td>
+      <td>高程反馈参数（几何1）</td>
+    </tr>
+    <tr>
+      <td><code>q2</code></td>
+      <td>float</td>
+      <td>0.8</td>
+      <td>高程反馈参数（几何2）</td>
+    </tr>
+    <tr>
+      <td><code>rmax</code></td>
+      <td>float</td>
+      <td>3.0</td>
+      <td>最大支流坡降因子（Kienholz算法）</td>
+    </tr>
+    <tr>
+      <td><code>f1</code></td>
+      <td>float</td>
+      <td>1.0</td>
+      <td>支流筛选参数（面积权重）</td>
+    </tr>
+    <tr>
+      <td><code>f2</code></td>
+      <td>float</td>
+      <td>0.2</td>
+      <td>支流筛选参数（长度分数）</td>
+    </tr>
+    <tr>
+      <td><code>a</code></td>
+      <td>float</td>
+      <td>3.0</td>
+      <td>Kienholz算法过滤参数a</td>
+    </tr>
+    <tr>
+      <td><code>b</code></td>
+      <td>float</td>
+      <td>0.7</td>
+      <td>Kienholz算法过滤参数b</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.9.4 气候参数</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>类型</th>
+      <th>默认值</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>baseline_climate</code></td>
+      <td>str</td>
+      <td>'W5E5'</td>
+      <td>基线气候数据集（W5E5或CRU）</td>
+    </tr>
+    <tr>
+      <td><code>temp_default_gradient</code></td>
+      <td>float</td>
+      <td>-6.5</td>
+      <td>默认温度梯度 (K/km)</td>
+    </tr>
+    <tr>
+      <td><code>temp_melt</code></td>
+      <td>float</td>
+      <td>-1.0</td>
+      <td>冰雪融化的温度阈值 (degC)</td>
+    </tr>
+    <tr>
+      <td><code>temp_all_solid</code></td>
+      <td>float</td>
+      <td>0.0</td>
+      <td>全固态降水温度阈值</td>
+    </tr>
+    <tr>
+      <td><code>temp_all_liq</code></td>
+      <td>float</td>
+      <td>2.0</td>
+      <td>全液态降水温度阈值</td>
+    </tr>
+    <tr>
+      <td><code>melt_f</code></td>
+      <td>float</td>
+      <td>5.0</td>
+      <td>雪的度日因子 (mm w.e. / (d*K))</td>
+    </tr>
+    <tr>
+      <td><code>prcp_fac</code></td>
+      <td>float</td>
+      <td>1.75</td>
+      <td>降水校正因子</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.9.5 冰动力学参数</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>类型</th>
+      <th>默认值</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>glen_a</code></td>
+      <td>float</td>
+      <td>2.4e-24</td>
+      <td>Glen流变参数 A (Pa^{-3}s^{-1})</td>
+    </tr>
+    <tr>
+      <td><code>glen_n</code></td>
+      <td>int</td>
+      <td>3</td>
+      <td>Glen流变指数 n</td>
+    </tr>
+    <tr>
+      <td><code>fs</code></td>
+      <td>float</td>
+      <td>0.0</td>
+      <td>滑动参数（0=无滑动, 1=完全滑动）</td>
+    </tr>
+    <tr>
+      <td><code>inversion_glen_a</code></td>
+      <td>float</td>
+      <td>2.4e-24</td>
+      <td>反演时使用的Glen A（可与演化不同）</td>
+    </tr>
+    <tr>
+      <td><code>cfl_number</code></td>
+      <td>float</td>
+      <td>0.01</td>
+      <td>CFL数（数值稳定性条件）</td>
+    </tr>
+    <tr>
+      <td><code>evolution_model</code></td>
+      <td>str</td>
+      <td>'FluxBased'</td>
+      <td>演化模型类型</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.9.6 冰川崩解参数</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>类型</th>
+      <th>默认值</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>calving_k</code></td>
+      <td>float</td>
+      <td>2.0</td>
+      <td>崩解速率参数（Oerlemans-Nick）</td>
+    </tr>
+    <tr>
+      <td><code>inversion_calving_k</code></td>
+      <td>float</td>
+      <td>2.0</td>
+      <td>反演时的崩解参数</td>
+    </tr>
+    <tr>
+      <td><code>free_board_marine_terminating</code></td>
+      <td>float</td>
+      <td>50.0</td>
+      <td>入海型冰川出水高度（freeboard）阈值 (m)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.9.7 输出控制</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>类型</th>
+      <th>默认值</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>store_model_geometry</code></td>
+      <td>bool</td>
+      <td>True</td>
+      <td>是否存储模型几何时间序列</td>
+    </tr>
+    <tr>
+      <td><code>store_diagnostic_variables</code></td>
+      <td>bool</td>
+      <td>True</td>
+      <td>是否存储诊断变量（通量、速度等）</td>
+    </tr>
+    <tr>
+      <td><code>store_fl_diagnostics</code></td>
+      <td>bool</td>
+      <td>False</td>
+      <td>是否存储逐流线点的完整诊断（磁盘密集）</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>3.10 如何覆盖参数</h2>
+
+<p>
+OGGM提供三种参数覆盖方式，优先级从低到高：
+</p>
+
+<ol>
+  <li><strong>修改params.cfg文件（最低优先级）：</strong>直接编辑 <code>oggm/params.cfg</code> 文件。这是永久性变更的方式，适合系统管理员和持久性部署。但升级OGGM包时会覆盖此文件，不适合临时实验。</li>
+  <li><strong>使用自定义配置文件：</strong>通过 <code>initialize(config_file='/path/to/my_params.cfg')</code> 指定自定义配置文件。这是推荐给研究者的方式——你可以为每个项目维护独立的参数配置。</li>
+  <li><strong>环境变量（中优先级）：</strong>在调用 <code>initialize()</code> 之前设置环境变量，或在shell中 <code>export OGGM_MELT_F=3.5</code>。非常适合Docker容器和CI/CD脚本。</li>
+  <li><strong>代码直接赋值（最高优先级）：</strong>在调用 <code>initialize()</code> 之后、运行任何任务之前，通过 <code>cfg.PARAMS['melt_f'] = 3.5</code> 直接设置。这是最灵活的临时修改方式。</li>
+</ol>
+
+<pre><code><span class="cmt"># 典型的参数覆盖模式</span>
+<span class="kw">import</span> oggm.cfg <span class="kw">as</span> cfg
+cfg.initialize()
+cfg.PARAMS[<span class="str">'melt_f'</span>] = <span class="num">3.5</span>        <span class="cmt"># 调整度日因子</span>
+cfg.PARAMS[<span class="str">'glen_a'</span>] = <span class="num">2.4e-24</span>   <span class="cmt"># 设置冰流变参数</span>
+cfg.PARAMS[<span class="str">'use_multiprocessing'</span>] = <span class="kw">True</span>
+cfg.PARAMS[<span class="str">'mp_processes'</span>] = <span class="num">8</span>    <span class="cmt"># 限制并行进程数</span></code></pre>
+
+<!-- ================================================================== -->
+<h2>3.11 BASENAMES：逻辑到物理文件名映射</h2>
+
+<p>
+<code>BASENAMES</code> 系统是OGGM中一个优雅的间接寻址设计。代码中从不使用硬编码的文件名，而是通过逻辑名称引用文件：
+</p>
+
+<pre><code><span class="cmt"># 在代码中使用逻辑名:</span>
+centerlines_file = gdir.get_filepath(<span class="str">'centerlines'</span>)
+<span class="cmt"># 解析为: gdir.dir / 'centerlines.pkl' (或 'centerlines_rcp85.pkl')</span>
+
+climate_file = gdir.get_filepath(<span class="str">'climate_historical'</span>)
+<span class="cmt"># 解析为: gdir.dir / 'climate_historical.nc'</span></code></pre>
+
+<p>
+<code>BASENAMES</code> 存储在 <code>DocumentedDict</code> 中，键为逻辑名，值为对应的物理文件名。扩展模块可以通过 <code>cfg.BASENAMES['my_new_file'] = ('Description', 'my_new_file.pkl')</code> 注册新的文件类型。
+</p>
+
+<p>
+当配合 <code>filesuffix</code> 机制使用时（参见第4章），逻辑名不变，但实际文件名会被自动追加后缀。例如 <code>cfg.PARAMS['filesuffix'] = '_rcp85'</code> 时，<code>get_filepath('centerlines')</code> 将解析为 <code>centerlines_rcp85.pkl</code>。
+</p>
+
+<!-- ================================================================== -->
+<h2>3.12 LRU文件缓存机制</h2>
+
+<p>
+<code>LRUHANDLERS</code> 是一个使用LRU（Least Recently Used）策略的文件句柄缓存，主要用于DEM瓦片（tiles）的重复访问。在全局冰川模拟中，相邻冰川通常共享同一DEM瓦片，缓存避免了重复打开和读取同一文件。
+</p>
+
+<pre><code><span class="cmt"># gis.py 中的典型使用模式</span>
+<span class="kw">def</span> <span class="fn">read_topo_tile</span>(<span class="dec">tile_name</span>):
+    <span class="cmt"># 从 LRUHANDLERS 获取缓存的 DEM tile</span>
+    <span class="kw">if</span> tile_name <span class="kw">in</span> cfg.LRUHANDLERS:
+        <span class="kw">return</span> cfg.LRUHANDLERS[tile_name]
+    <span class="cmt"># 缓存未命中：打开文件并加入LRU池</span>
+    cfg.LRUHANDLERS[tile_name] = open_topo(tile_name)
+    <span class="kw">return</span> cfg.LRUHANDLERS[tile_name]</code></pre>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout tip">
+  <div class="callout-title">LRU缓存的性能影响</div>
+  <p>
+    在RGI全量处理（~20万冰川）中，如果没有LRU缓存，每条冰川的GIS预处理都需要独立打开其DEM瓦片文件。由于相邻冰川共享瓦片，每个瓦片可能被重复打开数千次。LRU缓存将每个瓦片的I/O操作从数千次减少为1次。在实际测试中，这可以将全球GIS预处理的I/O时间从数天减少到数小时。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>3.13 物理常量</h2>
+
+<p>
+<code>cfg.py</code> 尾部定义了一组物理和数学常量，在整个代码库中使用以保证一致性：
+</p>
+
+<pre><code><span class="cmt"># 时间常量</span>
+SEC_IN_YEAR  = <span class="num">365</span> * <span class="num">24</span> * <span class="num">3600</span>     <span class="cmt"># 31536000</span>
+SEC_IN_DAY   = <span class="num">24</span> * <span class="num">3600</span>           <span class="cmt"># 86400</span>
+SEC_IN_MONTH = SEC_IN_YEAR / <span class="num">12</span>    <span class="cmt"># 2628000</span>
+
+<span class="cmt"># 物理常量</span>
+G  = <span class="num">9.81</span>           <span class="cmt"># 重力加速度 (m/s^2)</span>
+RHO = <span class="num">900.0</span>         <span class="cmt"># 冰密度 (kg/m^3)</span>
+RHO_W = <span class="num">1028.0</span>      <span class="cmt"># 海水密度 (kg/m^3)</span>
+
+<span class="cmt"># 数学/计算常量</span>
+GAUSSIAN_KERNEL = <span class="kw">None</span>   <span class="cmt"># 在initialize()时预计算的Gaussian平滑核</span></code></pre>
+
+<p>
+这些常量的定义为后续章节（如第8章的物质平衡模型）提供了统一的数值基础。
+</p>
+
+<!-- ================================================================== -->
+<h2>3.14 cfg.py 小结</h2>
+
+<p>
+<a id="summary"></a>
+</p>
+<p>
+<code>oggm/cfg.py</code>（约600行）是整个OGGM框架的配置中枢。它通过以下机制实现灵活而健壮的参数管理：
+</p>
+<ul>
+  <li><strong>五维全局状态：</strong>PARAMS、PATHS、BASENAMES、DATA、LRUHANDLERS 各司其职</li>
+  <li><strong>两级初始化：</strong>initialize_minimal() 用于轻量启动，initialize() 用于完整启动</li>
+  <li><strong>INI + 类型系统：</strong>ConfigObj + _typed_configobj_parser 提供类型安全的参数解析</li>
+  <li><strong>多级覆盖：</strong>配置文件 → 自定义配置 → 环境变量 → 代码赋值</li>
+  <li><strong>多进程安全：</strong>pack/unpack/set_manager 保证配置在进程间一致传播</li>
+  <li><strong>间接寻址：</strong>BASENAMES + filesuffix 机制支持多情景模拟</li>
+</ul>
+<p>
+深入理解cfg.py是有效使用和扩展OGGM的前提。在后续章节中，你将看到每个核心模块如何通过 <code>cfg.PARAMS</code> 获取其运行参数。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch02.html">第2章：架构总览与设计哲学</a></span>
+  <span class="next"><a href="ch04.html">第4章：GlacierDirectory：数据中枢</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源模型技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

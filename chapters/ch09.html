@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第9章 冰厚反演 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第9章 冰厚反演</h1>
+
+<p>
+<code>inversion.py</code> 约1180行，实现了OGGM的质量守恒冰厚反演方法（Farinotti et al. 2009; Huss and Farinotti 2012）。反演把表观物质平衡（apparent mass balance）积分得到的冰通量与SIA通量关系联系起来，从而求解沿流线的冰厚。没有冰厚信息，后续就无法可靠计算冰流速度、崩解通量或冰川对气候变化的动力响应。
+</p>
+
+<div class="callout tip">
+  <div class="callout-title">反演的直观理解</div>
+  <p>可以把本章理解为一个“从流量反推管道尺寸”的问题：上游表观物质平衡（apparent mass balance）告诉我们每个位置需要输送多少冰通量；SIA告诉我们给定坡度和冰厚时能输送多少冰。反演就是寻找一组冰厚，使这两者相容。</p>
+</div>
+
+<div class="callout warning">
+  <div class="callout-title">哪些结论要谨慎</div>
+  <p>反演冰厚不是直接观测。它对表观物质平衡（apparent mass balance）、Glen参数、滑动假设、冰床横截面（bed cross-section）和DEM/边界质量敏感。对碎屑覆盖、跃动、强非平衡、冰湖或入海型冰川，应把反演厚度作为带不确定性的初始化结果，而不是实测冰厚。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2>9.1 物理基础：质量守恒与SIA</h2>
+
+<p>
+冰厚反演的物理核心来源于两个约束：(1) <strong>质量守恒</strong>——通过给定横截面的冰通量（ice flux）必须等于上游集水区总物质平衡的积分；(2) <strong>浅冰近似（Shallow Ice Approximation, SIA）</strong>——给定表面坡度和冰厚，可以计算竖向积分的冰通量。
+</p>
+
+<p>关键公式（Huss and Farinotti 2012）：通过横截面的冰通量 q 为：</p>
+
+<pre><code>q = int_0^H u(z) dz = f_d * (2*A/(n+1)) * (rho*g*alpha)^n * H^(n+2)
+                         + f_s * (2*A) * (rho*g*alpha)^n * H^n</code></pre>
+
+<p>其中：</p>
+<ul>
+  <li><code>A</code> —— Glen流动律参数（默认2.4e-24 Pa<sup>-3</sup> s<sup>-1</sup>）</li>
+  <li><code>n</code> —— Glen指数，= 3</li>
+  <li><code>rho</code> —— 冰密度（900 kg m<sup>-3</sup>）</li>
+  <li><code>g</code> —— 重力加速度（9.81 m s<sup>-2</sup>）</li>
+  <li><code>alpha</code> —— 表面坡度（来自DEM）</li>
+  <li><code>H</code> —— 冰厚（未知量，反演目标）</li>
+  <li><code>f_d</code> —— 形变流动的形状因子（shape factor；取决于冰床横截面形状 bed cross-section geometry：抛物线/矩形/梯形）</li>
+  <li><code>f_s</code> —— 滑动的形状因子（shape factor；通常 f_s=0，即假设基底冻结）</li>
+</ul>
+
+<p>
+通量<code>q</code>来自上游表观物质平衡（apparent mass balance）的积分；在离散流线中，它本质上是上游净质量收支换算得到的冰体积流率。因此反演任务变为：<strong>已知 q 和 alpha，求解 H</strong>。
+</p>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout tip">
+  <div class="callout-title">质量通量的概念单位</div>
+  <p>
+    通量 q 的单位为 m<sup>3</sup> s<sup>-1</sup>（冰体积流率）。它由物质平衡积分换算而来：<code>q = flux / (rho * SEC_IN_YEAR)</code>，其中flux是kg s<sup>-1</sup>级别的质量流率。通常只对<code>flux > 0</code>的位置求解厚度——flux为负意味着该点上游无净物质积累。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>9.2 准备阶段（prepare_for_inversion）</h2>
+
+<p>
+<code>prepare_for_inversion</code>（约第53行）为每条流线的每个横截面位置预先计算冰厚求解所需的所有辅助量：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">prepare_for_inversion</span>(<span class="dec">gdir</span>, <span class="dec">inversion_input</span>=<span class="kw">None</span>):
+    <span class="cmt"># 1. 计算表面坡度：负梯度（高程向下降方向）</span>
+    slope = -np.gradient(hgt, dx)
+
+    <span class="cmt"># 2. 从表观物质平衡（apparent mass balance）计算质量通量</span>
+    flux = fl.flux * dx**<span class="dec">2</span> / SEC_IN_YEAR / rho   <span class="cmt"># m3 s-1</span>
+
+    <span class="cmt"># 3. 预计算通量/宽度比</span>
+    flux_a0 = flux / width * shape_factor           <span class="cmt"># 用于SIA多项式</span></code></pre>
+
+<p>
+表观物质平衡（apparent mass balance, apparent MB）考虑了冰川几何相对于参考几何的变化——不同于第8章的固定几何MB，它需要调用 <code>apparent_mb_from_any_mb</code> 来产生实际的物质收支。
+</p>
+
+<p>
+坡度计算中的关键细节：对坡度进行截断，<code>alpha = max(alpha, min_slope)</code>，其中 <code>min_slope = tan(1.5°)</code>。当实际坡度低于此阈值时（如在冰斗或宽阔河谷中），强制取这个最小值——因为零坡度会导致<code>alpha^n = 0</code>，使得冰厚方程退化。
+</p>
+
+<h3>9.2.1 形状因子（shape factor）</h3>
+
+<p>
+形状因子（shape factor）<code>f_d</code>取决于假定的冰床横截面形状（bed cross-section geometry）：
+</p>
+<ul>
+  <li><strong>半圆/抛物线</strong>（<code>f_d = 0.5</code>）：经典值，适用于山谷冰川</li>
+  <li><strong>矩形</strong>（<code>f_d = 1.0</code>）：无侧向约束（流速仅受厚度和坡度控制）</li>
+  <li><strong>梯形</strong>：介于两者之间，取决于形状参数<code>trapezoid_lambdas</code></li>
+</ul>
+
+<p>
+为了兼容默认抛物线方案和物理上更合理的梯形方案，OGGM使用 <code>mixed_min_shape</code> 阈值进行平滑过渡。
+</p>
+
+<!-- ================================================================== -->
+<h2>9.3 厚度求解器</h2>
+
+<p>
+对于质量通量 q、坡度 alpha、形状因子（shape factor） fs 和 f_d，SIA方程化为一个关于 H 的五次多项式：
+</p>
+
+<pre><code>H^<span class="dec">5</span> + a3 * H^<span class="dec">3</span> + a0 = <span class="dec">0</span></code></pre>
+
+<h3>9.3.1 多项式求解（_inversion_poly）</h3>
+
+<p>
+当<code>fs = 0</code>（无基底滑动）时，多项式退化为 <code>H^5 + a0 = 0</code>，解为 <code>H = (-a0)^(1/5)</code>（对应<code>_inversion_simple</code>，约第153行）。
+</p>
+
+<p>
+当<code>fs != 0</code>时（有基底滑动项），<code>_inversion_poly</code>（约第146行）使用<code>np.roots()</code>求解五次多项式的所有根，并选择物理上可接受的正实根作为厚度。多项式系数a3和a0由SIA方程系数组装。
+</p>
+
+<h3>9.3.2 遍历求解（_compute_thick）</h3>
+
+<p>
+<code>_compute_thick</code>（约第159行）对方程网格中所有<code>flux > 0</code>的横截面逐点求解。循环结构为：
+</p>
+
+<pre><code><span class="kw">for</span> i <span class="kw">in</span> <span class="dec">range</span>(<span class="dec">nx</span>):
+    <span class="kw">if</span> flux[i] > <span class="dec">0</span>:
+        thick[i] = _inversion_poly(a3[i], a0[i])
+    <span class="kw">else</span>:
+        thick[i] = <span class="dec">0</span>     <span class="cmt"># 无物质积累的位置 = 零冰厚</span></code></pre>
+
+<h3>9.3.3 Brent优化求解（sia_thickness_via_optim）</h3>
+
+<p>
+<code>sia_thickness_via_optim</code>（约第194行）是对<code>_inversion_poly</code>的替代方案，使用<code>brentq</code>数值求解非线性方程：
+</p>
+
+<pre><code>u = H^(<span class="dec">n</span>+<span class="dec">1</span>) * fd * (rho*g*alpha)^<span class="dec">n</span> + H^(<span class="dec">n</span>-<span class="dec">1</span>) * fs * (rho*g*alpha)^<span class="dec">n</span>
+sect * u - flux = <span class="dec">0</span></code></pre>
+
+<p>
+其中<code>sect</code>表示由冰厚和横截面形状确定的截面积。Brent方法比多项式求根更稳健，尤其适合梯形横截面等无法直接化成简单解析形式的情况，但每点需要多次函数求值。
+</p>
+
+<h3>9.3.4 sia_thickness 解析函数</h3>
+
+<p>
+<code>sia_thickness</code>（约第264行）是对外的公共接口，接受表面斜率、通量、宽度等参数，在内部调用<code>_compute_thick</code>进行解算。这是外部模块（如动力学、崩解等）使用SIA厚度估计的标准入口。
+</p>
+
+<!-- ================================================================== -->
+<h2>9.4 核心任务：mass_conservation_inversion</h2>
+
+<p>
+<code>mass_conservation_inversion</code>（约第359行）是完整的反演任务函数。其算法流程为：
+</p>
+
+<ol>
+  <li><strong>读取输入</strong>：从<code>gdir</code>加载流线、质量通量、DEM高程、宽度、坡度等信息。</li>
+  <li><strong>裁剪坡度</strong>：<code>alpha = max(slope, min_slope)</code>，防止数值问题。</li>
+  <li><strong>计算多项式系数</strong>：对每个横截面组装 <code>a0</code>（来自flux_a0）和 <code>a3</code>（来自fs项）。</li>
+  <li><strong>求解厚度</strong>：调用 <code>_compute_thick</code> 获取每个横截面的冰厚。</li>
+  <li><strong>计算体积</strong>：<code>V = sum(thick * width * dx)</code> 得到冰川总体积。</li>
+  <li><strong>梯形后备方案</strong>：对于<code>bed_shape</code>低于<code>mixed_min_shape</code>的横截面，切换到梯形SIA解算器（<code>sia_thickness_via_optim</code>），以更好地表示宽谷或平坦冰床横截面（bed cross-section）中的冰流。</li>
+</ol>
+
+<p>
+反演的三个关键输入参数是：
+</p>
+<ul>
+  <li><code>glen_a</code>（默认2.4e-24）：Glen流动律参数，控制冰的柔软度。越大的值代表越软的冰（更快的流动），从而获得更薄的厚度。</li>
+  <li><code>fs</code>（默认0）：基底滑动因子。非零值时允许冰床滑动，降低形变厚度。</li>
+  <li><code>trapezoid_lambdas</code>：梯形形状参数。在梯形横截面方案中控制谷底的平坦程度。</li>
+</ul>
+
+<span class="tag tag-advanced">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">参数敏感性与不确定性</div>
+  <p>
+    Glen参数的不确定性可达一个数量级（10<sup>-24</sup> ~ 10<sup>-23</sup>），这直接影响冰体积的不确定性。由于 H ∝ A^(-1/5)（简单情况下），即使A有两倍不确定性，对H的影响也只有约-13%。但通量q本身对MB校准误差更敏感——10%的MB偏差直接导致H^(n+2)中的10%体积变化。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>9.5 后处理</h2>
+
+<h3>9.5.1 过滤与平滑（filter_inversion_output）</h3>
+
+<p>
+<code>filter_inversion_output</code>（约第505行）对反演的原始厚度场进行两种后处理：
+</p>
+
+<ul>
+  <li><strong>末端凹槽平滑</strong>：冰川末端的反演厚度常出现非物理的"末端凹槽"（terminal depression）——因为通量在末端前急剧下降为0，导致局部厚度过薄。函数沿前缘方向应用低通滤波来平滑这些凹槽。</li>
+  <li><strong>转换为梯形表示</strong>：将抛物线-基底表示转换为更物理的梯形形状，以便后处理算法（如2D厚度场重建）使用。</li>
+</ul>
+
+<h3>9.5.2 反演速度计算（compute_inversion_velocities）</h3>
+
+<p>
+<code>compute_inversion_velocities</code>（约第632行）从反演的厚度场计算表面速度：
+</p>
+
+<pre><code>u_deformation = (<span class="dec">2</span>*A/(<span class="dec">n</span>+<span class="dec">1</span>)) * tau^<span class="dec">n</span> * H     <span class="cmt"># 内部形变贡献</span>
+u_basal = A * tau^<span class="dec">n</span> / lambda * ...               <span class="cmt"># 基底滑动贡献（可选）</span>
+u_surface = u_deformation + u_basal</code></pre>
+
+<p>
+当<code>fs=0</code>时，深度平均速度与表面速度之间满足 <code>u_mean/u_surface = (n+1)/(n+2)</code>；因此在<code>n=3</code>时，表面速度约为深度平均速度的1.25倍。速度和应力可用于验证反演的一致性，也可作为后续诊断量。
+</p>
+
+<h3>9.5.3 体积输出（get_inversion_volume）</h3>
+
+<p>
+<code>get_inversion_volume</code>（约第625行）计算反演的总冰体积：<code>V = sum(thick * width * dx)</code>，以m<sup>3</sup>为单位。这是在区域到全球尺度上汇总冰储存量的核心指标。
+</p>
+
+<!-- ================================================================== -->
+<h2>9.6 厚度场扩展（2D可视化）</h2>
+
+<h3>9.6.1 按海拔分配厚度（distribute_thickness_per_altitude）</h3>
+
+<p>
+<code>distribute_thickness_per_altitude</code>（约第728行）使用反距离加权（IDW）方法将一维沿中心线的厚度扩展到二维网格上。核心思想是：
+</p>
+
+<ol>
+  <li>对每个海拔带，收集该带内所有中心线点的厚度值。</li>
+  <li>在该海拔带内的所有冰川掩码像素上对厚度进行IDW插值——离中心线越近的像素获得更接近中心线点的厚度权重。</li>
+  <li>不同海拔带之间独立处理——避免了横谷的厚度平滑伪影。</li>
+</ol>
+
+<p>
+这种"按海拔分带"的IDW方法比全局IDW插值更能保持冰川厚度场中海坡梯度的物理合理性。
+</p>
+
+<h3>9.6.2 立方插值（distribute_thickness_interp）</h3>
+
+<p>
+<code>distribute_thickness_interp</code>（约第856行）是替代的二维插值方案，使用<code>scipy.interpolate.griddata</code>的<code>cubic</code>模式进行三阶插值。对于光滑的大型冰川（如阿拉斯加沿海冰川），这个方案能产生视觉上更平滑的厚度图，但可能模糊冰川边缘的厚度梯度。
+</p>
+
+<!-- ================================================================== -->
+<h2>9.7 崩解通量的厚度依赖</h2>
+
+<h3>9.7.1 calving_flux_from_depth</h3>
+
+<p>
+<code>calving_flux_from_depth</code>（约第960行）使用Oerlemans and Nick (2005)的崩解速率公式：
+</p>
+
+<pre><code>q_calving = k * water_depth * ice_thickness * width</code></pre>
+
+<p>
+其中<code>k</code>是崩解常数；OGGM v1.6.3中反演使用的默认<code>inversion_calving_k</code>为0.6 yr<sup>-1</sup>。<code>water_depth</code>是末端处的水深，可由冰厚、出水高度（freeboard）和水位约束估算。这个公式表达的是经验关系：更深水位通常对应更高的崩解通量。
+</p>
+
+<h3>9.7.2 迭代一致性求解（find_inversion_calving_from_any_mb）</h3>
+
+<p>
+<code>find_inversion_calving_from_any_mb</code>（约第1033行）解决了一个"鸡和蛋"问题：冰厚依赖于通量，而通量依赖于崩解损失，崩解又依赖于冰厚。通过迭代求解实现SIA反演与崩解通量之间的自洽：
+</p>
+
+<ol>
+  <li>用当前冰厚估计崩解通量。</li>
+  <li>将崩解通量加入物质平衡通量。</li>
+  <li>用修正的flux求解新冰厚。</li>
+  <li>重复直至收敛。</li>
+</ol>
+
+<p>
+一般在5-10次迭代内收敛。这是处理入海型冰川的关键技术，因为崩解是这类冰川质量损失的主要形式。
+</p>
+
+<!-- ================================================================== -->
+<h2>9.8 关键参数速查</h2>
+
+<table>
+  <thead>
+    <tr><th>参数名</th><th>默认值</th><th>作用</th><th>单元</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>glen_a</code></td><td>2.4e-24</td><td>Glen流动律参数</td><td>Pa<sup>-3</sup> s<sup>-1</sup></td></tr>
+    <tr><td><code>fs</code></td><td>0.0</td><td>基底滑动因子</td><td>无量纲</td></tr>
+    <tr><td><code>min_slope</code></td><td>tan(1.5°)</td><td>最小坡度阈值</td><td>m/m</td></tr>
+    <tr><td><code>mixed_min_shape</code></td><td>0.001</td><td>梯形切换阈值</td><td>无量纲</td></tr>
+    <tr><td><code>trapezoid_lambdas</code></td><td>变化</td><td>梯形形状参数</td><td>无量纲</td></tr>
+    <tr><td><code>inversion_calving_k</code></td><td>0.6</td><td>反演阶段使用的崩解速率常数</td><td>yr<sup>-1</sup></td></tr>
+    <tr><td><code>use_kcalving_for_inversion</code></td><td><code>False</code></td><td>是否在反演中启用k-calving校正</td><td>-</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2>9.9 总结</h2>
+
+<p>
+<code>inversion.py</code> 将第5章到第8章的成果——地形、几何、气候、物质平衡——融合为一个统一的冰厚度反演框架。物理上，它基于质量守恒和浅冰近似这两个冰川学的基石原理；数值上，它将问题转化为五次多项式的求根或Brent数值优化；工程上，它用迭代方法和自适应形状因子（shape factor）处理从山谷冰川到入海型冰川的多样化冰川形态。
+</p>
+
+<p>
+反演的冰厚场连接了预处理和正演模拟：在此之前是GIS处理、几何参数化和物质平衡建模，在此之后是冰流正演、冰川演化和海平面贡献估计。反演精度会影响后续动力学模拟：若反演偏薄，冰川响应通常偏快；若反演偏厚，响应通常偏慢。因此，冰厚反演的参数选择和区域校准（特别是<code>inversion_glen_a</code>）是OGGM应用中必须认真检查的环节。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch08.html">第8章：物质平衡模型</a></span>
+  <span class="next"><a href="ch10.html">第10章：冰川动力学与演化</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>

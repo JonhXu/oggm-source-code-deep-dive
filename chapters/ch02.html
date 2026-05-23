@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第2章 架构总览与设计哲学 — OGGM 源码深度解析</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="main">
+
+<h1>第2章 架构总览与设计哲学</h1>
+
+<p>
+理解一个复杂科学软件的架构，是深入源码阅读的前提。OGGM的代码库约含10万行Python代码，分布在数十个模块中。本章从宏观层面解构OGGM的架构设计，重点分析其核心设计模式——特别是<code>@entity_task</code>和<code>@global_task</code>装饰器——以及数据如何在各模块间流动。
+</p>
+
+<!-- ================================================================== -->
+<h2>2.1 高层架构图</h2>
+
+<p>
+下图展示了OGGM的主要模块及其依赖关系。箭头表示"依赖/导入"方向（A ← B 表示 B 导入 A）：
+</p>
+
+<div class="arch-diagram">
+<pre><code>
+
+                      ┌─────────────────────────────────────┐
+                      │         oggm.cli / oggm.sandbox      │
+                      │         (用户界面 & 实验代码)          │
+                      └──────┬──────────────┬───────────────┘
+                             │              │
+                      ┌──────▼──────────────▼───────────────┐
+                      │         oggm.workflow                │
+                      │   (预定义处理工作流: init_glacier_    │
+                      │    regions → gis_prepro → climate_   │
+                      │    historical → inversion →           │
+                      │    evolution_run)                     │
+                      └──────┬──────────────┬───────────────┘
+                             │              │
+           ┌─────────────────▼──┐    ┌─────▼─────────────────┐
+           │   oggm.core        │    │   oggm.shop            │
+           │  ┌───────────────┐ │    │  ┌───────────────────┐ │
+           │  │ gis           │ │    │  │ bedmachine        │ │
+           │  │ centerlines   │ │    │  │ rgitopo           │ │
+           │  │ climate       │ │    │  │ ecowitt           │ │
+           │  │ massbalance   │ │    │  │ ...               │ │
+           │  │ inversion     │ │    │  └───────────────────┘ │
+           │  │ flowline      │ │    └────────────────────────┘
+           │  │ dynamics      │ │
+           │  └───────────────┘ │
+           └────────┬───────────┘
+                    │
+           ┌────────▼───────────┐
+           │   oggm.utils       │
+           │  ┌───────────────┐ │
+           │  │ _workflow     │ │ ← entity_task / global_task 装饰器
+           │  │ _funcs        │ │ ← 栅格/几何工具函数
+           │  │ g2ti          │ │ ← GlacierDirectory 类
+           │  │ (gdir.py)     │ │
+           │  └───────────────┘ │
+           └────────┬───────────┘
+                    │
+           ┌────────▼───────────┐
+           │   oggm.cfg         │
+           │  ┌───────────────┐ │
+           │  │ PARAMS        │ │ ← 参数配置
+           │  │ PATHS         │ │ ← 路径管理
+           │  │ BASENAMES     │ │ ← 文件名映射
+           │  │ initialize()  │ │ ← 系统初始化
+           │  └───────────────┘ │
+           └────────────────────┘
+
+</code></pre>
+</div>
+
+<p>
+可以看到，依赖关系遵循清晰的分层结构：<code>cfg</code>（配置层）是最底层；<code>utils</code>（工具层）依赖它；<code>core</code>（核心算法）和<code>shop</code>（扩展模块）依赖<code>utils</code>；<code>workflow</code>（工作流层）编排<code>core</code>中的任务；<code>cli</code>和<code>sandbox</code>则位于最上层，面向最终用户。
+</p>
+
+<span class="tag tag-beginner">入门</span>
+<div class="callout tip">
+  <div class="callout-title">源码阅读顺序建议</div>
+  <p>
+    如果你将OGGM源码阅读视为一项工程活动，推荐的阅读顺序为：
+    (1) <code>oggm/cfg.py</code> — 理解配置系统（约600行，1小时）；
+    (2) <code>oggm/utils/_workflow.py</code> — 理解 <code>entity_task</code> 装饰器和工作流机制（约600行中前300行）；
+    (3) <code>oggm/utils/g2ti.py</code> — GlacierDirectory类（约1400行，可先读构造函数和关键方法）；
+    (4) <code>oggm/core/gis.py</code> — 中心线计算（约1000行）——这是pipeline的第一个实体任务（entity task）。
+    后续各章的安排即按此顺序展开。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>2.2 entity_task 装饰器：OGGM的核心设计模式</h2>
+
+<p>
+<code>@entity_task</code> 是OGGM架构中最关键的抽象。它位于 <code>oggm/utils/_workflow.py</code> 第422至530行，是一个Python装饰器，将普通函数包装为可处理单一冰川实体的"任务"。其核心代码签名如下：
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">entity_task</span>(<span class="dec">task_func</span>, <span class="str">*</span>, <span class="dec">writes_output</span>=<span class="kw">None</span>, <span class="dec">base_version</span>=<span class="kw">None</span>,
+                  <span class="dec">log_level</span>=<span class="str">'INFO'</span>, <span class="dec">ignore_errors</span>=<span class="kw">False</span>, <span class="dec">operation</span>=<span class="str">'entity_task'</span>):
+    <span class="cmt"># 包装器实现（约100行）</span>
+    <span class="kw">def</span> <span class="fn">deco</span>(<span class="dec">task_function</span>):
+        <span class="cmt"># 1. 提取任务名称（函数名）</span>
+        <span class="cmt"># 2. 设置 base_version 用于版本兼容性检查</span>
+        <span class="cmt"># 3. 包装为 _entity_task_wrapper</span>
+        <span class="kw">return</span> new_func
+    <span class="kw">return</span> deco</code></pre>
+
+<p>
+当一个函数被 <code>@entity_task</code> 装饰后，它自动获得以下能力：
+</p>
+
+<ol>
+  <li><strong>自动跳过（Auto-skip）：</strong>如果任务的所有输出文件都已存在且未过期，任务自动跳过。这由 <code>_entity_task_wrapper</code> 中的 <code>_auto_skip_task()</code> 函数实现（_workflow.py:340-420）。检查逻辑是：遍历任务通过 <code>writes_output</code> 或 <code>@task_output</code> 声明的输出文件列表，如果全部存在则跳过执行。</li>
+
+  <li><strong>日志记录：</strong>每次任务执行的时间戳、持续时间、成功/失败状态自动写入GlacierDirectory的 <code>task_status.json</code> 日志文件。如果任务失败，完整的traceback也会被记录。</li>
+
+  <li><strong>错误处理：</strong>支持 <code>ignore_errors=True</code> 模式（默认），即任务失败时不抛出异常，而是记录错误日志并标记任务状态为失败，让后续任务继续处理其他冰川。也支持 <code>ignore_errors=False</code> 模式，失败时立即终止。</li>
+
+  <li><strong>超时控制：</strong>通过 <code>mp_pool_timeout_task</code> 参数，可以为每个任务设置最大运行时间（以秒为单位），防止个别异常冰川长时间占用计算资源。</li>
+
+  <li><strong>版本兼容性：</strong><code>base_version</code> 机制确保旧版本代码不会处理新版本代码创建的预处理器数据，避免难以调试的隐蔽错误。</li>
+</ol>
+
+<p>
+典型使用模式（以 <code>gis_prepro_tasks</code> 中的 <code>compute_centerlines</code> 为例）：
+</p>
+
+<pre><code><span class="kw">@entity_task</span>(<span class="dec">log</span>, <span class="str">writes_output</span>=[<span class="str">'centerlines'</span>, <span class="str">'glacier_grid'</span>,
+                          <span class="str">'hypsometry'</span>])
+<span class="kw">def</span> <span class="fn">compute_centerlines</span>(<span class="dec">gdir</span>, <span class="dec">div_id</span>=0, <span class="dec">min_m</span>=<span class="kw">None</span>,
+                         <span class="dec">single_fl</span>=<span class="kw">None</span>, **kwargs):
+    <span class="cmt"># 函数体内只需关注冰川物理逻辑</span>
+    <span class="cmt"># 跳过、日志、错误处理全部由装饰器负责</span>
+    ...</code></pre>
+
+<span class="tag tag-advanced">专家</span>
+<div class="callout expert">
+  <div class="callout-title">entity_task 内部的自动跳过机制源码剖析</div>
+  <p>
+    自动跳过逻辑的核心位于 <code>oggm/utils/_workflow.py</code> 的 <code>_auto_skip_task()</code> 函数（约第340行）。它执行以下步骤：
+  </p>
+  <ol>
+    <li>调用 <code>reset_task_status(gdir, task_name)</code> 清除旧状态</li>
+    <li>从 <code>writes_output</code> 参数（或函数中 <code>task_output</code> 列表）获取输出文件名列表</li>
+    <li>对每个输出文件名，调用 <code>gdir.has_file(filename)</code> 检查文件是否存在</li>
+    <li>如果所有输出文件都存在，设置 <code>gdir.task_status[task_name] = 'skipped'</code> 并返回 <code>True</code></li>
+    <li>如果任一文件缺失，返回 <code>False</code>，任务将实际执行</li>
+  </ol>
+  <p>
+    这个机制的意义在于：当处理1万条冰川时，如果某些步骤失败需要重新运行，已成功处理的冰川会被自动跳过而无需额外逻辑。这极大地简化了大规模并行作业的重启流程。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>2.3 global_task 装饰器</h2>
+
+<p>
+<code>@global_task</code>（位于 _workflow.py 第533-566行）是 <code>@entity_task</code> 的"全局"变体。它用于处理不针对单一冰川的全系统操作，例如：
+</p>
+
+<ul>
+  <li>编译所有冰川的物质平衡统计信息</li>
+  <li>生成全局的交叉验证汇总表</li>
+  <li>创建区域汇总的shapefile</li>
+</ul>
+
+<p>
+与 <code>entity_task</code> 不同的是，<code>global_task</code> 的签名不要求 <code>gdir</code> 作为第一个参数，且其自动跳过逻辑基于单个全局日志文件而非每个冰川的任务状态。其实现更为简单，约30行代码。
+</p>
+
+<pre><code><span class="kw">def</span> <span class="fn">global_task</span>(<span class="dec">log</span>, <span class="dec">task_func</span>=<span class="kw">None</span>, <span class="str">*</span>, <span class="dec">operation</span>=<span class="str">'global_task'</span>,
+                  <span class="dec">writes_output</span>=<span class="kw">None</span>):
+    <span class="cmt"># 简化版 entity_task：</span>
+    <span class="cmt"># - 不绑定 gdir</span>
+    <span class="cmt"># - 跳过逻辑基于 writes_output 中的文件是否存在</span>
+    <span class="cmt"># - 日志写入全局文件（而非 per-gdir）</span>
+    ...</code></pre>
+
+<!-- ================================================================== -->
+<h2>2.4 核心设计原则</h2>
+
+<p>
+OGGM的设计遵循以下四条核心原则，理解它们有助于把握源码中的各种约定：
+</p>
+
+<h3>2.4.1 基于实体的处理（Entity-based Processing）</h3>
+<p>
+OGGM的基本处理单元是"冰川"（glacier entity），每个冰川有一个独立的GlacierDirectory，存储其所有中间数据和模型输出。这种设计使得处理高度可并行：不同冰川之间没有数据依赖，可以独立地在不同CPU核心或不同计算节点上处理。这通过 <code>@entity_task</code> 和 <code>utils._workflow.execute_entity_task()</code> 实现。
+</p>
+
+<h3>2.4.2 配置驱动行为（Configuration-driven Behavior）</h3>
+<p>
+OGGM中几乎所有数值参数和路径设置都由 <code>oggm.cfg.PARAMS</code> 字典控制（参见第3章）。这意味着绝大多数行为变更不需要修改源码——只需修改 <code>params.cfg</code> 文件或通过环境变量覆盖。例如，将融化因子 <code>melt_f</code> 从默认值5.0改为3.0，即可全局转换所有物质平衡计算。
+</p>
+
+<h3>2.4.3 名称间接寻址（Filename Indirection）</h3>
+<p>
+代码中从不直接使用硬编码的文件名（如 <code>'model_geometry.nc'</code>），而是通过 <code>BASENAMES</code> 字典进行逻辑名称到物理名称的映射。这个设计使得 <code>filesuffix</code> 机制成为可能——通过添加后缀（如 <code>'_rcp85'</code>, <code>'_rcp26'</code>），同一冰川在同一工作目录下可以运行多个气候情景的模拟而互不干扰（详见第4章）。
+</p>
+
+<h3>2.4.4 功能分区（Separation of Concerns）</h3>
+<p>
+<code>core/</code> 目录下的每个模块负责一个单一的科学领域（中心线、气候、物质平衡、反演、动力学），彼此之间通过GlacierDirectory中的文件进行数据交换，而非直接函数调用。这使得：
+</p>
+<ul>
+  <li>模块可以独立测试和替换</li>
+  <li><code>shop/</code> 中的扩展模块可以无缝接入数据管道</li>
+  <li>新模型的集成只需确保输出文件格式与下游兼容即可</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2>2.5 数据流：从RGI到冰川演化预测</h2>
+
+<p>
+OGGM的核心数据流遵循以下管线（pipeline）：
+</p>
+
+<div class="arch-diagram">
+<pre><code>
+RGI轮廓 (shapefile)
+    │
+    ▼
+[Step 1: gis_prepro]─── 从DEM提取冰川地形
+    │                     输出: glacier_grid.json, dem_source.json,
+    │                           hypsometry.csv, centerlines.pkl
+    ▼
+[Step 2: climate]────── 为每条冰川插入气候时间序列
+    │                     输出: climate_historical.nc, gcm_data.nc
+    ▼
+[Step 3: massbalance]── 基于气候计算历史物质平衡
+    │                     输出: ref_tstars.csv, local_mustar.json
+    ▼
+[Step 4: inversion]──── 反演冰厚度分布
+    │                     输出: inversion_output.pkl,
+    │                           inversion_flowlines.pkl
+    ▼
+[Step 5: dynamics]───── 运行冰动力演化模型
+    │                     输出: model_geometry.nc,
+    │                           model_diagnostics.nc
+    ▼
+最终输出: 冰川体积/面积/长度时间序列
+</code></pre>
+</div>
+
+<p>
+<strong>关键点：</strong>每一步的输出文件是下一步的输入。这种基于文件的耦合（而非基于函数调用的耦合）是OGGM能够实现大规模并行处理的基础——每个步骤的代码只需要读取上一阶段产生的文件，不需要持有上一阶段的内存对象。
+</p>
+
+<!-- ================================================================== -->
+<h2>2.6 两种处理模式</h2>
+
+<p>
+OGGM支持两种冰川几何表示模式：
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>特性</th>
+      <th>中心线模式（centerline-based）</th>
+      <th>高程带模式（elevation-band-based）</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>几何表示</td>
+      <td>沿流线的离散网格点（~100-500点）</td>
+      <td>按高程分带的面积-海拔分布</td>
+    </tr>
+    <tr>
+      <td>冰流动</td>
+      <td>物理SIA (shallow ice approximation)</td>
+      <td>简化的体积响应模型</td>
+    </tr>
+    <tr>
+      <td>冰厚度估计</td>
+      <td>物理反演</td>
+      <td>体积-面积缩放 (volume-area scaling)</td>
+    </tr>
+    <tr>
+      <td>计算成本</td>
+      <td>高（每条冰川数秒到数分钟）</td>
+      <td>低（每条冰川毫秒级）</td>
+    </tr>
+    <tr>
+      <td>适用场景</td>
+      <td>详细单个冰川模拟、区域精度研究</td>
+      <td>大规模集合模拟、快速敏感性分析</td>
+    </tr>
+    <tr>
+      <td>代码位置</td>
+      <td><code>oggm/core/centerlines.py</code>, <code>flowline.py</code></td>
+      <td><code>oggm/core/flowline.py</code> (MixedFlowline)</td>
+    </tr>
+  </tbody>
+</table>
+
+<span class="tag tag-intermediate">进阶</span>
+<div class="callout warning">
+  <div class="callout-title">模式选择指南</div>
+  <p>
+    如果你有100条以下的研究冰川且关注详细的冰厚度分布和动力学行为，使用中心线模式。如果你的目标是全球尺度（RGI全部约20万条冰川）的集合模拟——尤其是在需要运行上百种气候情景的Monte Carlo分析中——那么高程带（elevation-band）模式是唯一可行的选择。OGGM的FluxBasedModel可以处理两种模式的输出，但你需要在初始化时通过 <code>cfg.PARAMS['evolution_model']</code> 进行设置。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>2.7 GlacierDirectory：数据中枢预览</h2>
+
+<p>
+<code>GlacierDirectory</code>（定义于 <code>oggm/utils/g2ti.py</code> 或更早的 <code>oggm/utils/_workflow.py</code>，约第2643-3960行，共约1300行）是OGGM架构中核心的数据结构。它充当每条冰川的"数据中枢"，管理着：
+</p>
+
+<ul>
+  <li><strong>目录结构：</strong>冰川的所有文件存储在 <code>base_dir/RGIID[:8]/RGIID[:11]/RGIID/</code> 路径下（例如 <code>per_glacier/RGI60-11/00/RGI60-11.00001/</code>）</li>
+  <li><strong>文件读写：</strong>提供统一的方法读写pickle、shapefile、JSON和NetCDF文件，所有路径都经由 <code>BASENAMES</code> 间接解析</li>
+  <li><strong>任务日志：</strong>维护 <code>task_status.json</code>，记录每个entity_task的执行时间、状态和错误日志</li>
+  <li><strong>参考数据缓存：</strong>气候参考数据通过 <code>set_ref_mb_data()</code> 和 <code>get_ref_mb_data()</code> 方法进行延迟加载</li>
+</ul>
+
+<p>
+GlacierDirectory的详细剖析见第4章。
+</p>
+
+<!-- ================================================================== -->
+<h2>2.8 冰川目录（GlacierDirectory）中的文件组织</h2>
+
+<p>
+一个完全处理后的冰川目录（GlacierDirectory）包含以下典型文件：
+</p>
+
+<pre><code>per_glacier/RGI60-11/00/RGI60-11.00001/
+    ├── glacier_grid.json          # 本地网格定义
+    ├── dem_source.json            # DEM数据源信息
+    ├── centerlines.pkl            # 计算的流线 (shapely geometries)
+    ├── downstream_line.pkl        # 下游线（downstream line）几何
+    ├── flowline_catchments.pkl    # 流线集水区
+    ├── hypsometry.csv             # 面积-高程分布表
+    ├── climate_historical.nc      # 历史气候时间序列 (NetCDF)
+    ├── gcm_data.nc                # GCM偏移气候数据
+    ├── local_mustar.json          # 校准后的温度敏感性
+    ├── ref_tstars.csv             # 参考温度偏差
+    ├── inversion_input.pkl        # 反演参数
+    ├── inversion_flowlines.pkl    # 包含厚度的反演后流线
+    ├── inversion_output.pkl       # 反演输出完整对象
+    ├── model_geometry.nc          # 模型几何时间序列
+    ├── model_diagnostics.nc       # 模型诊断变量时间序列
+    └── task_status.json           # 任务执行日志</code></pre>
+
+<!-- ================================================================== -->
+<h2>2.9 包结构总览</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>包/模块</th>
+      <th>代码量（约行数）</th>
+      <th>功能</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>oggm/cfg.py</code></td>
+      <td>~600</td>
+      <td>配置系统：PARAMS, PATHS, BASENAMES, 初始化</td>
+    </tr>
+    <tr>
+      <td><code>oggm/utils/_workflow.py</code></td>
+      <td>~600</td>
+      <td>entity_task/global_task装饰器, execute_entity_task并行调度</td>
+    </tr>
+    <tr>
+      <td><code>oggm/utils/g2ti.py</code></td>
+      <td>~1400</td>
+      <td>GlacierDirectory类（文件I/O, 任务状态, 气候数据管理）</td>
+    </tr>
+    <tr>
+      <td><code>oggm/utils/_funcs.py</code></td>
+      <td>~2000</td>
+      <td>通用栅格/矢量工具函数（地图投影、重采样、平滑等）</td>
+    </tr>
+    <tr>
+      <td><code>oggm/core/gis.py</code></td>
+      <td>~1200</td>
+      <td>GIS预处理：冰川mask、DEM提取、地形属性</td>
+    </tr>
+    <tr>
+      <td><code>oggm/core/centerlines.py</code></td>
+      <td>~1800</td>
+      <td>中心线计算：Kienholz算法、分叉处理</td>
+    </tr>
+    <tr>
+      <td><code>oggm/core/climate.py</code></td>
+      <td>~2500</td>
+      <td>气候数据：GCM降尺度、温度/降水插值</td>
+    </tr>
+    <tr>
+      <td><code>oggm/core/massbalance.py</code></td>
+      <td>~3000</td>
+      <td>物质平衡：度日模型、温度指数模型（temperature-index model）、校准</td>
+    </tr>
+    <tr>
+      <td><code>oggm/core/inversion.py</code></td>
+      <td>~800</td>
+      <td>冰厚度反演：逆SIA求解器</td>
+    </tr>
+    <tr>
+      <td><code>oggm/core/flowline.py</code></td>
+      <td>~5000</td>
+      <td>Flowline和FluxBasedModel：动力核心</td>
+    </tr>
+    <tr>
+      <td><code>oggm/core/dynamics.py</code></td>
+      <td>~600</td>
+      <td>动力演化时间步控制</td>
+    </tr>
+    <tr>
+      <td><code>oggm/shop/</code></td>
+      <td>~5000</td>
+      <td>扩展模块：bedmachine、rgitopo、ecowitt等</td>
+    </tr>
+    <tr>
+      <td><code>oggm/cli/</code></td>
+      <td>~400</td>
+      <td>命令行接口（基于click）</td>
+    </tr>
+    <tr>
+      <td><code>oggm/sandbox/</code></td>
+      <td>~2000</td>
+      <td>实验性代码、非核心贡献</td>
+    </tr>
+    <tr>
+      <td><code>oggm/tests/</code></td>
+      <td>~6000</td>
+      <td>单元测试（基于pytest）</td>
+    </tr>
+  </tbody>
+</table>
+
+<span class="tag tag-advanced">专家</span>
+<div class="callout expert">
+  <div class="callout-title">代码量最大的模块：flowline.py</div>
+  <p>
+    <code>oggm/core/flowline.py</code>（约5000行）是整个代码库中最庞大、最复杂的模块。它包含了Flowline类的定义、FluxBasedModel（基于通量的动力演化求解器）、从VAScalingConverter到MixedFlowline的多种几何表示转换器，以及数十个辅助函数。本书第11-13章将对其进行深入分析。对于初次阅读的读者，建议先理解Flowline的数据结构（约300行），再接触FluxBasedModel的步进逻辑（约1000行），最后才是各种边界条件处理。
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2>2.10 模块间的依赖关系图</h2>
+
+<p>
+以下为更精确的模块级DAG（有向无环图）：
+</p>
+
+<pre><code>cfg.py                    # 零依赖（仅依赖标准库 + configobj）
+  ├── _workflow.py        # 依赖 cfg
+  │     ├── g2ti.py       # 依赖 _workflow, cfg
+  │     └── _funcs.py     # 依赖 cfg
+  ├── core/gis.py         # 依赖 utils._funcs, g2ti, _workflow
+  ├── core/centerlines.py # 依赖 gis, _funcs, _workflow
+  ├── core/climate.py     # 依赖 gis, _funcs, _workflow
+  ├── core/massbalance.py # 依赖 climate, _funcs, _workflow
+  ├── core/inversion.py   # 依赖 massbalance, flowline, _workflow
+  ├── core/flowline.py    # 依赖 massbalance, _funcs, _workflow
+  ├── core/dynamics.py    # 依赖 flowline, _workflow
+  └── shop/*              # 依赖 core/*, utils/* —— 但从不被core依赖</code></pre>
+
+<p>
+这种单向、无循环的依赖结构使得OGGM的模块可以独立开发和测试。特别值得注意的是，<code>shop/</code> 中的模块可以依赖 <code>core/</code> 和 <code>utils/</code>，但反过来不行——这确保了核心代码的稳定性不受扩展模块变化的影响。
+</p>
+
+<!-- ================================================================== -->
+<nav class="chapter-nav">
+  <span class="prev"><a href="ch01.html">第1章：冰川模拟与OGGM概述</a></span>
+  <span class="next"><a href="ch03.html">第3章：配置系统深度解析</a></span>
+</nav>
+
+<footer>
+  <p>OGGM 源码深度解析 &copy; 2025 — 一本面向冰川研究者的开源模型技术指南</p>
+</footer>
+
+</div>
+</body>
+</html>
