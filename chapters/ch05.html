@@ -5,8 +5,168 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>第5章 GIS操作与DEM处理 — OGGM 源码深度解析</title>
 <link rel="stylesheet" href="../css/style.css">
+
+<style id="book-nav-style">
+:root { --book-nav-width: 320px; }
+#sidebar {
+  position: fixed;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--book-nav-width);
+  background: var(--sidebar-bg, #f8f9fa);
+  border-right: 1px solid var(--border, #d5dbdb);
+  overflow-y: auto;
+  padding: 24px;
+  z-index: 1000;
+  transition: transform .2s ease;
+}
+#sidebar h2 {
+  font-size: 1.1rem;
+  color: var(--primary, #1a5276);
+  margin: 0 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid var(--secondary, #2e86c1);
+}
+#sidebar .home-link {
+  display: block;
+  margin-bottom: 14px;
+  color: var(--secondary, #2e86c1);
+  text-decoration: none;
+  font-size: .92rem;
+  font-weight: 600;
+}
+#sidebar .part-title {
+  font-size: .85rem;
+  font-weight: 700;
+  color: var(--primary, #1a5276);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  margin: 20px 0 6px;
+}
+#sidebar ol { list-style: none; padding: 0; margin: 0; }
+#sidebar ol li { margin: 2px 0; }
+#sidebar ol li a {
+  display: block;
+  padding: 4px 8px;
+  font-size: .9rem;
+  color: #555;
+  text-decoration: none;
+  border-radius: 4px;
+  transition: all .15s;
+}
+#sidebar ol li a:hover { background: #e1ecf4; color: var(--primary, #1a5276); }
+#sidebar ol li a.active { background: var(--secondary, #2e86c1); color: #fff; font-weight: 600; }
+#search-box {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border, #d5dbdb);
+  border-radius: 4px;
+  font-size: .9rem;
+  margin-bottom: 16px;
+  font-family: var(--font-sans, 'Segoe UI', system-ui, -apple-system, sans-serif);
+}
+#nav-toggle {
+  position: fixed;
+  top: 14px;
+  left: calc(var(--book-nav-width) + 14px);
+  z-index: 1100;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border, #d5dbdb);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--primary, #1a5276);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,.08);
+  transition: left .2s ease;
+}
+body.has-book-nav #main,
+body.has-book-nav .container {
+  margin-left: calc(var(--book-nav-width) + 40px);
+  margin-right: auto;
+}
+body.has-book-nav.nav-collapsed #sidebar { transform: translateX(-100%); }
+body.has-book-nav.nav-collapsed #nav-toggle { left: 14px; }
+body.has-book-nav.nav-collapsed #main,
+body.has-book-nav.nav-collapsed .container {
+  margin-left: auto;
+  margin-right: auto;
+}
+@media print {
+  #sidebar, #nav-toggle { display: none; }
+  body.has-book-nav #main, body.has-book-nav .container { margin-left: 0; max-width: 100%; }
+}
+@media (max-width: 900px) {
+  #sidebar { transform: translateX(-100%); box-shadow: 4px 0 18px rgba(0,0,0,.14); }
+  #nav-toggle { left: 14px; }
+  body.has-book-nav #main,
+  body.has-book-nav .container {
+    margin-left: 0;
+    max-width: 100%;
+  }
+  body.has-book-nav.nav-open #sidebar { transform: translateX(0); }
+}
+</style>
+
 </head>
-<body>
+<body class="has-book-nav">
+<button id="nav-toggle" type="button" aria-label="隐藏目录" title="隐藏目录">×</button>
+<nav id="sidebar" aria-label="全书目录">
+  <h2>OGGM 源码深度解析</h2>
+  <a class="home-link" data-page="index.html" href="../index.html">首页 / 关于本书</a>
+  <input type="text" id="search-box" placeholder="搜索章节..." oninput="searchTOC()">
+  <div class="part-title">第一部分：基础篇</div>
+  <ol>
+    <li><a data-page="ch01.html" href="ch01.html">第1章 冰川模拟与OGGM概述</a></li>
+    <li><a data-page="ch02.html" href="ch02.html">第2章 架构总览与设计哲学</a></li>
+    <li><a data-page="ch03.html" href="ch03.html">第3章 配置系统深度解析（cfg.py）</a></li>
+    <li><a data-page="ch04.html" href="ch04.html">第4章 GlacierDirectory：数据中枢</a></li>
+  </ol>
+  <div class="part-title">第二部分：预处理管线</div>
+  <ol>
+    <li><a data-page="ch05.html" href="ch05.html">第5章 GIS操作与DEM处理</a></li>
+    <li><a data-page="ch06.html" href="ch06.html">第6章 冰川中心线与几何参数化</a></li>
+    <li><a data-page="ch07.html" href="ch07.html">第7章 气候数据处理与Shop模块</a></li>
+    <li><a data-page="ch08.html" href="ch08.html">第8章 物质平衡模型：理论与实现</a></li>
+    <li><a data-page="ch09.html" href="ch09.html">第9章 冰厚反演</a></li>
+  </ol>
+  <div class="part-title">第三部分：冰动力学</div>
+  <ol>
+    <li><a data-page="ch10.html" href="ch10.html">第10章 冰流动力学：Flowline模型</a></li>
+    <li><a data-page="ch11.html" href="ch11.html">第11章 数值方法详解</a></li>
+    <li><a data-page="ch12.html" href="ch12.html">第12章 崩解参数化</a></li>
+    <li><a data-page="ch13.html" href="ch13.html">第13章 动态预热（dynamic spinup）与模型初始化</a></li>
+    <li><a data-page="ch14.html" href="ch14.html">第14章 二维SIA模块</a></li>
+  </ol>
+  <div class="part-title">第四部分：运行工作流</div>
+  <ol>
+    <li><a data-page="ch15.html" href="ch15.html">第15章 OGGM工作流管线</a></li>
+    <li><a data-page="ch16.html" href="ch16.html">第16章 命令行界面</a></li>
+    <li><a data-page="ch17.html" href="ch17.html">第17章 MPI并行计算</a></li>
+    <li><a data-page="ch18.html" href="ch18.html">第18章 图形与可视化</a></li>
+  </ol>
+  <div class="part-title">第五部分：扩展专题</div>
+  <ol>
+    <li><a data-page="ch19.html" href="ch19.html">第19章 Sandbox与实验模块</a></li>
+    <li><a data-page="ch20.html" href="ch20.html">第20章 扩展OGGM：自定义模块</a></li>
+    <li><a data-page="ch21.html" href="ch21.html">第21章 测试框架与质量保障</a></li>
+  </ol>
+  <div class="part-title">第六部分：教程专题</div>
+  <ol>
+    <li><a data-page="tutorials.html" href="tutorials.html">第22章 OGGM教程全集</a></li>
+  </ol>
+  <div class="part-title">附录</div>
+  <ol>
+    <li><a data-page="appendix_a.html" href="appendix_a.html">附录A API参考</a></li>
+    <li><a data-page="appendix_b.html" href="appendix_b.html">附录B 参数参考手册</a></li>
+    <li><a data-page="appendix_c.html" href="appendix_c.html">附录C 文件格式参考</a></li>
+    <li><a data-page="appendix_d.html" href="appendix_d.html">附录D 术语表</a></li>
+  </ol>
+</nav>
+
 <div id="main">
 
 <h1>第5章 GIS操作与DEM处理</h1>
@@ -361,5 +521,65 @@ bins = np.arange(<span class="dec">min_elev</span> // <span class="dec">50</span
 </footer>
 
 </div>
+
+<script id="book-nav-script">
+(function() {
+  function storageAvailable() {
+    try { localStorage.setItem('__book_nav_test__', '1'); localStorage.removeItem('__book_nav_test__'); return true; }
+    catch (e) { return false; }
+  }
+  var canStore = storageAvailable();
+  var body = document.body;
+  var toggle = document.getElementById('nav-toggle');
+  var searchBox = document.getElementById('search-box');
+  var smallScreen = window.matchMedia('(max-width: 900px)');
+
+  if (canStore && localStorage.getItem('book-nav-collapsed') === '1' && !smallScreen.matches) {
+    body.classList.add('nav-collapsed');
+  }
+
+  function updateToggleLabel() {
+    if (!toggle) return;
+    var hidden = smallScreen.matches ? !body.classList.contains('nav-open') : body.classList.contains('nav-collapsed');
+    toggle.textContent = hidden ? '☰' : '×';
+    toggle.setAttribute('aria-label', hidden ? '展开目录' : '隐藏目录');
+    toggle.setAttribute('title', hidden ? '展开目录' : '隐藏目录');
+  }
+
+  window.searchTOC = function() {
+    if (!searchBox) return;
+    var q = searchBox.value.toLowerCase();
+    document.querySelectorAll('#sidebar ol li a').forEach(function(a) {
+      a.style.display = a.textContent.toLowerCase().includes(q) ? 'block' : 'none';
+    });
+  };
+
+  function markActiveLink() {
+    var current = location.pathname.split('/').pop() || 'index.html';
+    document.querySelectorAll('#sidebar a[data-page]').forEach(function(a) {
+      if (a.getAttribute('data-page') === current) a.classList.add('active');
+    });
+  }
+
+  if (toggle) {
+    toggle.addEventListener('click', function() {
+      if (smallScreen.matches) {
+        body.classList.toggle('nav-open');
+      } else {
+        body.classList.toggle('nav-collapsed');
+        if (canStore) localStorage.setItem('book-nav-collapsed', body.classList.contains('nav-collapsed') ? '1' : '0');
+      }
+      updateToggleLabel();
+    });
+  }
+  smallScreen.addEventListener('change', function() {
+    body.classList.remove('nav-open');
+    updateToggleLabel();
+  });
+  markActiveLink();
+  updateToggleLabel();
+})();
+</script>
+
 </body>
 </html>
