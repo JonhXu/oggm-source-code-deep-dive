@@ -1,4 +1,4 @@
-# OGGM 源码深度解析 V1.0
+# OGGM 源码深度解析 V2.0
 
 《OGGM 源码深度解析》是一部面向中国冰川研究人员的 OGGM 电子书，覆盖 OGGM 基本原理、源码结构、核心物理过程与代码实操。
 
@@ -7,6 +7,10 @@
 可通过 GitHub Pages 直接阅读电子书：
 
 - https://jonhxu.github.io/oggm-source-code-deep-dive/
+
+## PDF归档版
+
+- https://jonhxu.github.io/oggm-source-code-deep-dive/pdf/OGGM源码深度解析-V2.0-电子书.pdf
 
 ## 作者信息
 
@@ -22,4 +26,4 @@
 
 ## 内容说明
 
-本仓库保存的是静态 HTML 电子书版本。所有章节位于 `chapters/`，样式位于 `css/`。
+本仓库保存的是静态 HTML 电子书版本和 PDF 归档版。所有章节位于 `chapters/`，样式位于 `css/`，PDF 文件位于 `pdf/`。
