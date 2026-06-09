@@ -10,7 +10,7 @@
 
 ## PDF归档版
 
-- https://jonhxu.github.io/oggm-source-code-deep-dive/pdf/OGGM源码深度解析-V2.0-电子书.pdf
+- https://jonhxu.github.io/oggm-source-code-deep-dive/pdf/OGGM-Source-Code-Deep-Dive-V2.0.pdf
 
 ## 作者信息
 
